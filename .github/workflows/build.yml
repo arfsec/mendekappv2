@@ -1,0 +1,55 @@
+name: Build APK Release - Mendek Arena Masteran Burung v2
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter 3.24.5
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+          cache: true
+
+      - name: Ensure Android Gradle Wrapper
+        run: |
+          if [ ! -f android/gradlew ]; then
+            flutter create --org com.mendekarena --project-name mendek_arena_masteran --platforms android .
+          fi
+          rm -f test/widget_test.dart
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Analyze Dart Code
+        run: flutter analyze
+
+      - name: Build Release APK
+        run: flutter build apk --release
+
+      - name: Prepare Release Artifact
+        run: |
+          mkdir -p release-output
+          cp build/app/outputs/flutter-apk/app-release.apk release-output/mendek-arena-masteran-burung-v2.0.0.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mendek-arena-masteran-burung-v2-apk
+          path: release-output/mendek-arena-masteran-burung-v2.0.0.apk
+          retention-days: 30
