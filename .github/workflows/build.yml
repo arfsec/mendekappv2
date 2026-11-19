@@ -29,12 +29,14 @@ jobs:
       - name: Generate Android Shell & Preserve Custom V2 Code
         run: |
           mkdir -p /tmp/custom_android_backup
-          cp -r android/app/src/main /tmp/custom_android_backup/main
+          cp android/app/src/main/AndroidManifest.xml /tmp/custom_android_backup/AndroidManifest.xml
+          cp -r android/app/src/main/kotlin /tmp/custom_android_backup/kotlin
           cp android/app/build.gradle /tmp/custom_android_backup/build.gradle
           flutter create --org com.mendekarena --project-name mendek_arena_masteran --platforms android .
           sed -i 's/1.8.22/1.9.24/g' android/settings.gradle
-          rm -rf android/app/src/main
-          cp -r /tmp/custom_android_backup/main android/app/src/main
+          cp /tmp/custom_android_backup/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          rm -rf android/app/src/main/kotlin
+          cp -r /tmp/custom_android_backup/kotlin android/app/src/main/kotlin
           cp /tmp/custom_android_backup/build.gradle android/app/build.gradle
           rm -f test/widget_test.dart
 
