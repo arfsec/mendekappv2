@@ -8,6 +8,16 @@ import '../services/db_service.dart';
 import '../services/notif_service.dart';
 import '../services/url_helper.dart';
 
+class AddEditResult {
+  final Schedule schedule;
+  final bool autoDownloadOffline;
+
+  const AddEditResult({
+    required this.schedule,
+    this.autoDownloadOffline = false,
+  });
+}
+
 class AddEditScreen extends StatefulWidget {
   final Schedule? existingSchedule;
 
@@ -35,6 +45,7 @@ class _AddEditScreenState extends State<AddEditScreen> {
   ParsedVideoUrl? _detectedUrl;
   bool _isSaving = false;
   bool _isResolvingLink = false;
+  bool _autoDownloadOffline = true;
 
   static const List<MapEntry<int, String>> _dayItems = [
     MapEntry(1, 'Sen'),
@@ -69,7 +80,9 @@ class _AddEditScreenState extends State<AddEditScreen> {
       _playMinutes = existing.playMinutes > 0 ? existing.playMinutes : 15;
       _pauseMinutes = existing.pauseMinutes > 0 ? existing.pauseMinutes : 5;
       _detectedUrl = UrlHelper.parseUrl(existing.url);
+      _autoDownloadOffline = existing.platform == 'youtube' && !existing.isOfflineReady;
     } else {
+      _autoDownloadOffline = true;
       _startTime = const TimeOfDay(hour: 3, minute: 0);
       _endTime = const TimeOfDay(hour: 7, minute: 0);
       _selectedDays = {1, 2, 3, 4, 5, 6, 7};
@@ -233,8 +246,18 @@ class _AddEditScreenState extends State<AddEditScreen> {
 
       await NotifService.instance.scheduleNotificationsFor(schedule);
 
+      final bool shouldAutoDownload = _autoDownloadOffline &&
+          resolved.platform == 'youtube' &&
+          !schedule.isOfflineReady &&
+          ApiService.instance.remoteConfig.enableOfflineDownload;
+
       if (mounted) {
-        Navigator.of(context).pop(true);
+        Navigator.of(context).pop(
+          AddEditResult(
+            schedule: schedule,
+            autoDownloadOffline: shouldAutoDownload,
+          ),
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -403,6 +426,65 @@ class _AddEditScreenState extends State<AddEditScreen> {
                           ],
                         ),
                       ),
+                      if (_detectedUrl!.platform == 'youtube' &&
+                          ApiService.instance.remoteConfig.enableOfflineDownload) ...[
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 10,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF8FAFC),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: _autoDownloadOffline
+                                  ? const Color(0xFF93C5FD)
+                                  : const Color(0xFFE5E5EA),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.offline_pin_rounded,
+                                color: _autoDownloadOffline
+                                    ? _appleBlue
+                                    : const Color(0xFF8E8E93),
+                                size: 22,
+                              ),
+                              const SizedBox(width: 10),
+                              const Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      'Otomatis Unduh Offline ke HP',
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w700,
+                                        color: Color(0xFF1C1C1E),
+                                      ),
+                                    ),
+                                    Text(
+                                      '100% berbunyi saat layar terkunci tanpa kuota internet',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color: Color(0xFF6E6E73),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              CupertinoSwitch(
+                                value: _autoDownloadOffline,
+                                activeColor: _appleBlue,
+                                onChanged: (val) =>
+                                    setState(() => _autoDownloadOffline = val),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
                     ],
                   ],
                 ),

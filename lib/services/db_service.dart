@@ -132,4 +132,63 @@ class DbService {
       whereArgs: [id],
     );
   }
+
+  Future<void> seedDefaultSchedulesIfEmpty() async {
+    final existing = await getAllSchedules();
+    if (existing.isNotEmpty) return;
+    final int nowMs = DateTime.now().millisecondsSinceEpoch;
+    final List<Schedule> defaults = [
+      Schedule(
+        id: 'preset_subuh_cililin',
+        name: 'Masteran Subuh — Cililin & Kenari',
+        url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+        platform: 'youtube',
+        videoId: 'dQw4w9WgXcQ',
+        startHour: 3,
+        startMinute: 30,
+        endHour: 6,
+        endMinute: 30,
+        days: const [1, 2, 3, 4, 5, 6, 7],
+        isActive: true,
+        createdAt: nowMs,
+        playMinutes: 15,
+        pauseMinutes: 5,
+      ),
+      Schedule(
+        id: 'preset_siang_murai',
+        name: 'Isian Siang — Tengkek & Kapas Tembak',
+        url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+        platform: 'youtube',
+        videoId: 'dQw4w9WgXcQ',
+        startHour: 11,
+        startMinute: 30,
+        endHour: 14,
+        endMinute: 0,
+        days: const [1, 2, 3, 4, 5, 6, 7],
+        isActive: true,
+        createdAt: nowMs + 1,
+        playMinutes: 20,
+        pauseMinutes: 10,
+      ),
+      Schedule(
+        id: 'preset_malam_istirahat',
+        name: 'Masteran Malam — Pelan Kerodong',
+        url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+        platform: 'youtube',
+        videoId: 'dQw4w9WgXcQ',
+        startHour: 19,
+        startMinute: 0,
+        endHour: 22,
+        endMinute: 0,
+        days: const [1, 2, 3, 4, 5, 6, 7],
+        isActive: false,
+        createdAt: nowMs + 2,
+        playMinutes: 15,
+        pauseMinutes: 5,
+      ),
+    ];
+    for (final item in defaults) {
+      await insertSchedule(item);
+    }
+  }
 }

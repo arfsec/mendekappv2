@@ -1,15 +1,19 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' show ImageFilter;
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:uuid/uuid.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/schedule.dart';
 import '../services/api_service.dart';
 import '../services/db_service.dart';
 import '../services/notif_service.dart';
 import '../services/offline_service.dart';
+import '../services/url_helper.dart';
 import '../widgets/premium_visuals.dart';
 import 'add_edit_screen.dart';
 import 'login_screen.dart';
@@ -26,6 +30,13 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const String _prefNightStandby = 'mendek_night_standby_v1';
+  static const String _prefBirdName = 'mendek_bird_name_v1';
+  static const String _prefBirdMode = 'mendek_bird_mode_v1';
+  static const String _prefCareItems = 'mendek_care_items_v1';
+
+  String _birdName = 'Murai Petir';
+  String _birdMode = 'Harian';
+  List<Map<String, dynamic>> _careItems = [];
 
   List<Schedule> _schedules = [];
   bool _isLoading = true;
@@ -113,10 +124,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     final bridgeOk = await NotifService.instance.pingNativeAlarmBridge();
+    await DbService.instance.seedDefaultSchedulesIfEmpty();
+    await _loadCareState();
     final schedules = await _syncLocalOfflinePaths(
       await DbService.instance.getAllSchedules(),
     );
     await NotifService.instance.rescheduleAll(schedules);
+    final activeForStandby = schedules.where((s) => s.isActive).toList();
+    if (activeForStandby.isNotEmpty) {
+      await NotifService.instance.startStandbyService(
+        activeCount: activeForStandby.length,
+        nextLabel: _nextAlarmCountdownLabel(activeForStandby),
+      );
+    } else {
+      await NotifService.instance.stopStandbyService();
+    }
 
     PermissionStatusSummary perms;
     if (widget.initialPayload == null || widget.initialPayload!.isEmpty) {
@@ -148,6 +170,127 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         buildPremiumRoute(LoginScreen(pendingPayload: widget.initialPayload)),
       );
     }
+  }
+
+  List<Map<String, dynamic>> _defaultCareItems() {
+    return [
+      {'title': 'Embun Pagi (05:30)', 'detail': 'Gantang teras 30 menit', 'done': false},
+      {'title': 'Pakan EF Pagi (07:00)', 'detail': '5 jangkrik + air bersih', 'done': false},
+      {'title': 'Mandi Keramba (08:00)', 'detail': 'Mandi pagi secukupnya', 'done': false},
+      {'title': 'Jemur Pagi (08:30)', 'detail': 'Jemur 35 menit lalu teduh', 'done': false},
+      {'title': 'EF Sore (16:30)', 'detail': '4 jangkrik + kroto', 'done': false},
+      {'title': 'Kerodong Malam (18:30)', 'detail': 'Siap masteran malam', 'done': false},
+    ];
+  }
+
+  Future<void> _loadCareState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final name = prefs.getString(_prefBirdName);
+    final mode = prefs.getString(_prefBirdMode);
+    final rawCare = prefs.getString(_prefCareItems);
+    List<Map<String, dynamic>> items = _defaultCareItems();
+    if (rawCare != null && rawCare.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawCare) as List<dynamic>;
+        items = decoded
+            .whereType<Map>()
+            .map((m) => Map<String, dynamic>.from(m))
+            .toList();
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    setState(() {
+      if (name != null && name.isNotEmpty) _birdName = name;
+      if (mode != null && mode.isNotEmpty) _birdMode = mode;
+      _careItems = items;
+    });
+  }
+
+  Future<void> _saveCareState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefBirdName, _birdName);
+    await prefs.setString(_prefBirdMode, _birdMode);
+    await prefs.setString(_prefCareItems, jsonEncode(_careItems));
+  }
+
+  Future<void> _toggleCareDone(int index) async {
+    setState(() {
+      final current = _careItems[index]['done'] == true;
+      _careItems[index]['done'] = !current;
+    });
+    await _saveCareState();
+  }
+
+  Future<void> _resetDailyCare() async {
+    setState(() {
+      for (final item in _careItems) {
+        item['done'] = false;
+      }
+    });
+    await _saveCareState();
+  }
+
+  Future<void> _setBirdMode(String mode) async {
+    setState(() => _birdMode = mode);
+    await _saveCareState();
+  }
+
+  Future<void> _showEditBirdAndCareDialog({bool isNewCare = false}) async {
+    final titleCtrl = TextEditingController(text: isNewCare ? '' : _birdName);
+    final detailCtrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(isNewCare ? 'Tambah Jadwal Rawatan / EF' : 'Ubah Nama Gacoan'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: titleCtrl,
+              decoration: InputDecoration(
+                labelText: isNewCare ? 'Nama Tugas (cth: Kroto Siang 12:00)' : 'Nama Burung',
+              ),
+            ),
+            if (isNewCare) ...[
+              const SizedBox(height: 10),
+              TextField(
+                controller: detailCtrl,
+                decoration: const InputDecoration(
+                  labelText: 'Takaran / Catatan (cth: 1 sendok teh)',
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Batal'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Simpan'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final text = titleCtrl.text.trim();
+    if (text.isEmpty) return;
+    setState(() {
+      if (isNewCare) {
+        _careItems.add({
+          'title': text,
+          'detail': detailCtrl.text.trim().isEmpty
+              ? 'Rawatan rutin harian'
+              : detailCtrl.text.trim(),
+          'done': false,
+        });
+      } else {
+        _birdName = text;
+      }
+    });
+    await _saveCareState();
   }
 
   Future<void> _toggleNightStandby(bool enabled) async {
@@ -252,6 +395,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final schedules = await _syncLocalOfflinePaths(
       await DbService.instance.getAllSchedules(),
     );
+    final activeForStandby = schedules.where((s) => s.isActive).toList();
+    if (activeForStandby.isNotEmpty) {
+      unawaited(
+        NotifService.instance.startStandbyService(
+          activeCount: activeForStandby.length,
+          nextLabel: _nextAlarmCountdownLabel(activeForStandby),
+        ),
+      );
+    } else {
+      unawaited(NotifService.instance.stopStandbyService());
+    }
     if (mounted) {
       setState(() {
         _schedules = schedules;
@@ -280,7 +434,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     _isPlayerOpen = true;
-    unawaited(NotifService.instance.clearActiveAlarmNotification());
 
     try {
       await Navigator.of(context).push(
@@ -436,17 +589,98 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  int? _getExpiringDaysLeft() {
+    final rawExp = ApiService.instance.session?.expiresAt;
+    if (rawExp == null || rawExp.trim().isEmpty) return null;
+    final parsed = DateTime.tryParse(rawExp.trim().replaceFirst(' ', 'T'));
+    if (parsed == null) return null;
+    final diffHours = parsed.difference(DateTime.now()).inHours;
+    if (diffHours > 72) return null;
+    return (diffHours / 24).ceil();
+  }
+
+  Future<void> _launchWhatsAppRenew() async {
+    final session = ApiService.instance.session;
+    final phone = _cfg.waNumber.replaceAll(RegExp(r'[^0-9]'), '');
+    final msg = Uri.encodeComponent(
+      'Halo Admin ${_cfg.appName}, Key sewa saya (${session?.key ?? ''}) akan segera habis. Mohon info perpanjang.',
+    );
+    final uri = Uri.parse('https://wa.me/$phone?text=$msg');
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {}
+  }
+
+  Future<void> _installCatalogPreset(CatalogPreset preset) async {
+    final parsed = UrlHelper.parseUrl(preset.url);
+    final platform = parsed?.platform ??
+        (preset.platform == 'tiktok' ? 'tiktok' : 'youtube');
+    final videoId = parsed?.videoId ?? preset.id;
+    final cleanUrl = parsed?.originalUrl ?? preset.url;
+
+    final schedule = Schedule(
+      id: const Uuid().v4(),
+      name: preset.title,
+      url: cleanUrl,
+      platform: platform,
+      videoId: videoId,
+      startHour: 3,
+      startMinute: 0,
+      endHour: 7,
+      endMinute: 0,
+      days: const [1, 2, 3, 4, 5, 6, 7],
+      isActive: true,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+      playMinutes: preset.recommendedPlayMin > 0 ? preset.recommendedPlayMin : 15,
+      pauseMinutes: preset.recommendedPauseMin >= 0 ? preset.recommendedPauseMin : 5,
+    );
+
+    await DbService.instance.insertSchedule(schedule);
+    await NotifService.instance.scheduleNotificationsFor(schedule);
+    await _reloadSchedules();
+
+    if (!mounted) return;
+    if (platform == 'youtube' && _cfg.enableOfflineDownload) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '"${preset.title}" dipasang! Mulai mengunduh offline ke HP...',
+          ),
+        ),
+      );
+      unawaited(_downloadOffline(schedule));
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('"${preset.title}" berhasil dipasang ke jadwal!'),
+        ),
+      );
+    }
+  }
+
   Future<void> _openAddEdit([Schedule? schedule]) async {
-    final saved = await Navigator.of(context).push<bool>(
+    final res = await Navigator.of(context).push<AddEditResult>(
       buildPremiumRoute(AddEditScreen(existingSchedule: schedule)),
     );
-    if (saved == true) {
+    if (res != null) {
       if (schedule != null) {
         _triggeredScheduleKeys.removeWhere(
           (k) => k.startsWith('${schedule.id}_'),
         );
       }
       await _reloadSchedules();
+      if (res.autoDownloadOffline &&
+          res.schedule.platform == 'youtube' &&
+          mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Jadwal "${res.schedule.name}" tersimpan! Mengunduh video offline...',
+            ),
+          ),
+        );
+        unawaited(_downloadOffline(res.schedule));
+      }
     }
   }
 
@@ -850,9 +1084,76 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Widget _buildSchedulesTab(List<Schedule> activeSchedules, int activeCount) {
+    final int? expiringDays = _getExpiringDaysLeft();
+    final List<CatalogPreset> catalog = ApiService.instance.catalog;
+
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 116),
       children: [
+        if (expiringDays != null)
+          Container(
+            margin: const EdgeInsets.only(bottom: 14),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFFFBEB),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: const Color(0xFFFCD34D), width: 1.5),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.warning_amber_rounded,
+                      color: Color(0xFFB45309),
+                      size: 22,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        expiringDays <= 0
+                            ? 'Masa Sewa Key Berakhir Hari Ini'
+                            : 'Masa Sewa Key Tinggal $expiringDays Hari Lagi',
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w800,
+                          color: Color(0xFF92400E),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Berakhir pada ${ApiService.instance.session?.expiresAt?.split(' ').first ?? '-'}. Perpanjang sekarang agar jadwal alarm masteran tidak terhenti.',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Color(0xFF78350F),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF059669),
+                      minimumSize: const Size(0, 42),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    onPressed: _launchWhatsAppRenew,
+                    icon: const Icon(Icons.chat_rounded, size: 18),
+                    label: const Text(
+                      'Perpanjang via WhatsApp',
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         if (_cfg.announcement.isNotEmpty)
           Container(
             margin: const EdgeInsets.only(bottom: 14),
@@ -879,6 +1180,66 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ],
             ),
           ),
+        Container(
+          margin: const EdgeInsets.only(bottom: 14),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: const Color(0xFFE5E5EA)),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEFF6FF),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(Icons.tune_rounded, color: _appleBlue, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '$_birdName • Mode $_birdMode',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w800,
+                        color: Color(0xFF1C1C1E),
+                      ),
+                    ),
+                    Text(
+                      '${_careItems.where((e) => e['done'] != true).length} jadwal rawat / EF belum selesai',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF6E6E73),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: _appleBlue,
+                  minimumSize: const Size(0, 38),
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                onPressed: () => setState(() => _activeTabIndex = 2),
+                child: const Text(
+                  'Setting',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                ),
+              ),
+            ],
+          ),
+        ),
         if (_permStatus != null && !_permStatus!.allGranted)
           Container(
             margin: const EdgeInsets.only(bottom: 16),
@@ -1097,6 +1458,105 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               onDelete: () => _deleteSchedule(schedule),
             ),
           ),
+        if (catalog.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Container(
+            margin: const EdgeInsets.only(bottom: 16),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: const Color(0xFFE5E5EA)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.library_music_rounded, color: _appleBlue, size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Katalog Masteran Rekomendasi Admin (${catalog.length})',
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                          color: Color(0xFF1C1C1E),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Ketuk 1 kali untuk langsung pasang jadwal & unduh offline ke HP.',
+                  style: TextStyle(fontSize: 12, color: Color(0xFF6E6E73)),
+                ),
+                const SizedBox(height: 12),
+                ...catalog.map(
+                  (preset) => Container(
+                    margin: const EdgeInsets.only(bottom: 10),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF8FAFC),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: const Color(0xFFE5E5EA)),
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                preset.title,
+                                style: const TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFF1C1C1E),
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                '${preset.species} • Putar ${preset.recommendedPlayMin}m / Jeda ${preset.recommendedPauseMin}m',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: Color(0xFF6E6E73),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        FilledButton(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: _appleBlue,
+                            minimumSize: const Size(0, 38),
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                          ),
+                          onPressed: () => _installCatalogPreset(preset),
+                          child: Text(
+                            preset.platform == 'youtube' &&
+                                    _cfg.enableOfflineDownload
+                                ? 'Pasang & Unduh'
+                                : 'Pasang',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -1353,12 +1813,114 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 116),
       children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text(
+              'Setting & Rawat Burung',
+              style: TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.w800,
+                color: Color(0xFF1C1C1E),
+              ),
+            ),
+            TextButton.icon(
+              onPressed: () => _showEditBirdAndCareDialog(isNewCare: false),
+              icon: const Icon(Icons.edit_rounded, size: 16),
+              label: Text(_birdName),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: ['Harian', 'Setting Lomba', 'Mabung', 'Pemulihan'].map((m) {
+            final selected = _birdMode == m;
+            return ChoiceChip(
+              label: Text(m),
+              selected: selected,
+              selectedColor: _appleBlue,
+              labelStyle: TextStyle(
+                color: selected ? Colors.white : const Color(0xFF1C1C1E),
+                fontWeight: FontWeight.w700,
+                fontSize: 12,
+              ),
+              onSelected: (_) => _setBirdMode(m),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 14),
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(color: const Color(0xFFE5E5EA)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    'Checklist Pakan EF & Rawat',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xFF1C1C1E),
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      TextButton(
+                        onPressed: _resetDailyCare,
+                        child: const Text('Reset'),
+                      ),
+                      TextButton.icon(
+                        onPressed: () => _showEditBirdAndCareDialog(isNewCare: true),
+                        icon: const Icon(Icons.add_rounded, size: 18),
+                        label: const Text('Tambah'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              ...List.generate(_careItems.length, (i) {
+                final item = _careItems[i];
+                final done = item['done'] == true;
+                return CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: done,
+                  activeColor: _appleBlue,
+                  onChanged: (_) => _toggleCareDone(i),
+                  title: Text(
+                    item['title']?.toString() ?? '',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      decoration: done ? TextDecoration.lineThrough : null,
+                      color: done ? const Color(0xFF8E8E93) : const Color(0xFF1C1C1E),
+                    ),
+                  ),
+                  subtitle: Text(
+                    item['detail']?.toString() ?? '',
+                    style: const TextStyle(fontSize: 12, color: Color(0xFF6E6E73)),
+                  ),
+                );
+              }),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
         const Padding(
           padding: EdgeInsets.only(left: 4, bottom: 12),
           child: Text(
             'Ringkasan Masteran Harian',
             style: TextStyle(
-              fontSize: 22,
+              fontSize: 18,
               fontWeight: FontWeight.w800,
               color: Color(0xFF1C1C1E),
             ),
@@ -1825,8 +2387,8 @@ class _IosBottomMenuBar extends StatelessWidget {
                   ),
                   Expanded(
                     child: _MenuBarItem(
-                      icon: Icons.bar_chart_rounded,
-                      label: 'Ringkasan',
+                      icon: Icons.tune_rounded,
+                      label: 'Setting',
                       selected: activeIndex == 2,
                       accentColor: accentColor,
                       onTap: () => onSelectTab(2),

@@ -23,6 +23,7 @@ class MasteranAlarmReceiver : BroadcastReceiver() {
     companion object {
         const val PREFS_NAME = "mendek_native_alarms"
         const val ACTION_FIRE_ALARM = "com.mendekarena.mendek_arena_masteran.ACTION_FIRE_ALARM"
+        const val ACTION_STOP_ALARM = "com.mendekarena.mendek_arena_masteran.ACTION_STOP_ALARM"
         const val EXTRA_REQUEST_CODE = "alarm_request_code"
         const val EXTRA_TITLE = "alarm_title"
         const val EXTRA_BODY = "alarm_body"
@@ -33,6 +34,8 @@ class MasteranAlarmReceiver : BroadcastReceiver() {
         const val EXTRA_REPEATING = "alarm_repeating"
         const val ALARM_CHANNEL_ID = "mendek_alarm_ring_v2"
         const val ALARM_NOTIF_ID = 99001
+        const val STANDBY_CHANNEL_ID = "mendek_standby_v2"
+        const val STANDBY_NOTIF_ID = 99000
 
         fun pendingIntentFlags(): Int {
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -131,6 +134,47 @@ class MasteranAlarmReceiver : BroadcastReceiver() {
             return notifManager
         }
 
+        fun buildStandbyNotification(
+            context: Context,
+            title: String,
+            body: String
+        ): Notification {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (nm.getNotificationChannel(STANDBY_CHANNEL_ID) == null) {
+                    val ch = NotificationChannel(
+                        STANDBY_CHANNEL_ID,
+                        "Siaga Alarm Latar Belakang",
+                        NotificationManager.IMPORTANCE_LOW
+                    ).apply {
+                        description = "Menjaga jadwal masteran tetap aktif meski aplikasi ditutup"
+                        setShowBadge(false)
+                        setSound(null, null)
+                    }
+                    nm.createNotificationChannel(ch)
+                }
+            }
+            val openIntent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            }
+            val openPi = PendingIntent.getActivity(context, 99000, openIntent, pendingIntentFlags())
+            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Notification.Builder(context, STANDBY_CHANNEL_ID)
+            } else {
+                @Suppress("DEPRECATION")
+                Notification.Builder(context).setPriority(Notification.PRIORITY_LOW)
+            }
+            val appIcon = context.applicationInfo.icon
+            return builder
+                .setSmallIcon(if (appIcon != 0) appIcon else android.R.drawable.ic_lock_idle_alarm)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .setContentIntent(openPi)
+                .build()
+        }
+
         fun buildAlarmNotification(
             context: Context,
             requestCode: Int,
@@ -147,6 +191,15 @@ class MasteranAlarmReceiver : BroadcastReceiver() {
                 pendingIntentFlags()
             )
 
+            val stopIntent = Intent(context, MasteranAlarmReceiver::class.java).apply {
+                action = ACTION_STOP_ALARM
+            }
+            val stopPendingIntent = PendingIntent.getBroadcast(
+                context,
+                99002,
+                stopIntent,
+                pendingIntentFlags()
+            )
             val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 Notification.Builder(context, ALARM_CHANNEL_ID)
             } else {
@@ -160,11 +213,17 @@ class MasteranAlarmReceiver : BroadcastReceiver() {
                 .setSmallIcon(if (appIcon != 0) appIcon else android.R.drawable.ic_lock_idle_alarm)
                 .setContentTitle(title)
                 .setContentText(body)
-                .setAutoCancel(true)
+                .setAutoCancel(false)
+                .setOngoing(true)
                 .setCategory(Notification.CATEGORY_ALARM)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setContentIntent(fullScreenPendingIntent)
                 .setFullScreenIntent(fullScreenPendingIntent, true)
+                .addAction(
+                    android.R.drawable.ic_media_pause,
+                    "STOP",
+                    stopPendingIntent
+                )
 
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
                 @Suppress("DEPRECATION")
@@ -294,7 +353,10 @@ class MasteranAlarmReceiver : BroadcastReceiver() {
             prefs.edit().clear().apply()
         }
 
-        fun clearActiveAlarmNotification(context: Context) {
+        fun clearActiveAlarmNotification(context: Context, forceStopService: Boolean = false) {
+            if (!forceStopService && MasteranAlarmService.isKeepAliveByPlayer) {
+                return
+            }
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.cancel(ALARM_NOTIF_ID)
             try {
@@ -306,6 +368,11 @@ class MasteranAlarmReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent == null) return
+        if (intent.action == ACTION_STOP_ALARM) {
+            MasteranAlarmService.isKeepAliveByPlayer = false
+            clearActiveAlarmNotification(context, forceStopService = true)
+            return
+        }
 
         val requestCode = intent.getIntExtra(EXTRA_REQUEST_CODE, 0)
         val title = intent.getStringExtra(EXTRA_TITLE) ?: "Masteran Burung Otomatis"

@@ -23,7 +23,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 // Ganti secret admin ini (atau set environment variable MENDEK_ADMIN_SECRET di server)
-define('ADMIN_SECRET', getenv('MENDEK_ADMIN_SECRET') ?: 'GANTI_SECRET_ADMIN_ANDA_2026');
+define('ADMIN_SECRET', getenv('MENDEK_ADMIN_SECRET') ?: 'mendek-admin-secret-ganti-ini');
 define('DB_DIR', __DIR__ . '/data');
 define('DB_FILE', DB_DIR . '/mendek_db.json');
 
@@ -38,7 +38,7 @@ function defaultDatabase(): array {
     return [
         'remote_config' => [
             'app_name' => 'Mendek Arena',
-            'logo_url' => 'https://limopancer.com/mendek/assets/logo.png',
+            'logo_url' => 'https://limopancer.com/mendek/assets/logo.jpg',
             'accent_color' => '#007AFF',
             'hero_title' => 'Masteran Burung Otomatis',
             'hero_subtitle' => 'Jadwal Harian, Fade-In Volume & Anti Layar Mati',
@@ -198,6 +198,7 @@ switch ($action) {
         $deviceId = trim((string)($input['device_id'] ?? ''));
         $deviceName = trim((string)($input['device_name'] ?? 'Android HP'));
         $appVersion = trim((string)($input['app_version'] ?? '2.0.0'));
+        $dryRun = !empty($input['dry_run']) || $deviceId === 'web-browser-preview-01';
 
         if ($rawKey === '' || $deviceId === '') {
             respond(400, ['ok' => false, 'message' => 'Key dan Device ID wajib diisi.']);
@@ -216,6 +217,9 @@ switch ($action) {
         }
 
         $boundId = trim((string)($record['bound_device_id'] ?? ''));
+        if ($boundId === 'web-browser-preview-01') {
+            $boundId = '';
+        }
         if ($boundId !== '' && $boundId !== $deviceId) {
             respond(403, [
                 'ok' => false,
@@ -223,12 +227,14 @@ switch ($action) {
             ]);
         }
 
-        $record['bound_device_id'] = $deviceId;
-        $record['device_name'] = $deviceName;
-        $record['app_version'] = $appVersion;
-        $record['last_seen'] = date('c');
-        $db['keys'][$rawKey] = $record;
-        saveDb($db);
+        if (!$dryRun) {
+            $record['bound_device_id'] = $deviceId;
+            $record['device_name'] = $deviceName;
+            $record['app_version'] = $appVersion;
+            $record['last_seen'] = date('c');
+            $db['keys'][$rawKey] = $record;
+            saveDb($db);
+        }
 
         respond(200, [
             'ok' => true,
@@ -237,7 +243,7 @@ switch ($action) {
                 'key' => $record['key'],
                 'label_user' => $record['label_user'],
                 'expires_at' => $record['expires_at'] ?? null,
-                'bound_device_id' => $record['bound_device_id'],
+                'bound_device_id' => $dryRun ? $boundId : $record['bound_device_id'],
             ],
             'remote_config' => $db['remote_config'],
         ]);
@@ -315,6 +321,27 @@ switch ($action) {
         foreach ($allowedFields as $field) {
             if (isset($input[$field])) {
                 $db['remote_config'][$field] = trim((string)$input[$field]);
+            }
+        }
+        $rawLogo = (string)($db['remote_config']['logo_url'] ?? '');
+        if (preg_match('/^data:image\/(png|jpe?g|webp);base64,(.+)$/i', $rawLogo, $m)) {
+            $ext = strtolower($m[1]) === 'jpeg' ? 'jpg' : strtolower($m[1]);
+            $bin = base64_decode($m[2], true);
+            if ($bin !== false && strlen($bin) > 0) {
+                $assetsDir = __DIR__ . '/assets';
+                if (!is_dir($assetsDir)) {
+                    @mkdir($assetsDir, 0755, true);
+                }
+                $targetFile = $assetsDir . '/uploaded_logo.' . $ext;
+                if (@file_put_contents($targetFile, $bin) !== false) {
+                    $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+                        || (($_SERVER['SERVER_PORT'] ?? '') === '443')
+                        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+                    $scheme = $isHttps ? 'https' : 'http';
+                    $host = $_SERVER['HTTP_HOST'] ?? 'limopancer.com';
+                    $basePath = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
+                    $db['remote_config']['logo_url'] = $scheme . '://' . $host . $basePath . '/assets/uploaded_logo.' . $ext . '?v=' . time();
+                }
             }
         }
         if (isset($input['enable_offline_download'])) {

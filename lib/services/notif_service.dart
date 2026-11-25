@@ -161,6 +161,63 @@ class NotifService {
     } catch (_) {}
   }
 
+  Future<void> startPlaybackForegroundService({
+    required String title,
+    required String body,
+    String payload = '',
+  }) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _nativeAlarmChannel.invokeMethod('startPlaybackForegroundService', {
+        'title': title,
+        'body': body,
+        'payload': payload,
+      });
+    } catch (_) {}
+  }
+
+  Future<void> stopPlaybackForegroundService() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _nativeAlarmChannel.invokeMethod('stopPlaybackForegroundService');
+    } catch (_) {}
+  }
+
+  Future<void> ensureBackgroundFallbackAudio({
+    required String title,
+    required String body,
+    String payload = '',
+  }) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _nativeAlarmChannel.invokeMethod('ensureBackgroundFallbackAudio', {
+        'title': title,
+        'body': body,
+        'payload': payload,
+      });
+    } catch (_) {}
+  }
+
+  Future<void> startStandbyService({
+    required int activeCount,
+    String? nextLabel,
+  }) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _nativeAlarmChannel.invokeMethod('startStandbyService', {
+        'title': 'Mendek Arena — Siaga Alarm ($activeCount jadwal)',
+        'body': nextLabel ?? 'Tetap berbunyi otomatis meski aplikasi ditutup & layar terkunci',
+      });
+    } catch (_) {}
+  }
+
+  Future<void> stopStandbyService() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _nativeAlarmChannel.invokeMethod('stopStandbyService');
+    } catch (_) {}
+  }
+
   Future<bool> _canUseFullScreenIntent() async {
     if (!Platform.isAndroid) return true;
     try {
@@ -311,7 +368,7 @@ class NotifService {
             'title': 'Masteran Burung: ${schedule.name}',
             'body':
                 'Memutar ${schedule.platformLabel} (${schedule.timeRangeText})',
-            'payload': schedule.payload,
+            'payload': '${schedule.payload}|LIVE|${schedule.localFilePath ?? ''}',
           });
           continue;
         } catch (e) {
@@ -355,7 +412,7 @@ class NotifService {
         uiLocalNotificationDateInterpretation:
             UILocalNotificationDateInterpretation.absoluteTime,
         matchDateTimeComponents: DateTimeComponents.dayOfWeekAndTime,
-        payload: schedule.payload,
+        payload: '${schedule.payload}|LIVE|${schedule.localFilePath ?? ''}',
       );
     }
   }
@@ -368,7 +425,7 @@ class NotifService {
     final int reqCode = 880000 + (DateTime.now().millisecondsSinceEpoch % 9999);
     final int triggerMillis =
         DateTime.now().add(Duration(seconds: seconds)).millisecondsSinceEpoch;
-    final String testPayload = '${schedule.payload}|TEST';
+    final String testPayload = '${schedule.payload}|TEST|${schedule.localFilePath ?? ''}';
 
     if (Platform.isAndroid) {
       try {

@@ -9,6 +9,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 import '../services/api_service.dart';
 import '../services/db_service.dart';
+import '../services/notif_service.dart';
 import '../services/offline_service.dart';
 import '../services/url_helper.dart';
 import '../widgets/premium_visuals.dart';
@@ -29,7 +30,7 @@ class PlayerScreen extends StatefulWidget {
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends State<PlayerScreen> {
+class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver {
   WebViewController? _webViewController;
   VideoPlayerController? _videoController;
   Timer? _countdownTimer;
@@ -62,16 +63,46 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _enterFullScreenAndWakelock();
     _parsePayloadAndSetup();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused && !_isOfflinePlayback && !_isPausedPhase) {
+      unawaited(
+        NotifService.instance.ensureBackgroundFallbackAudio(
+          title: widget.scheduleName ?? 'Masteran Burung Berjalan',
+          body: 'Audio cadangan aktif di layar terkunci / latar belakang',
+          payload: widget.payload,
+        ),
+      );
+    } else if (state == AppLifecycleState.resumed && !_isPausedPhase) {
+      unawaited(
+        NotifService.instance.startPlaybackForegroundService(
+          title: widget.scheduleName ?? 'Masteran Burung Berjalan',
+          body: 'Pemutar aktif meski layar dikunci atau aplikasi diminimize',
+          payload: widget.payload,
+        ),
+      );
+    }
   }
 
   Future<void> _enterFullScreenAndWakelock() async {
     await WakelockPlus.enable();
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    unawaited(
+      NotifService.instance.startPlaybackForegroundService(
+        title: widget.scheduleName ?? 'Masteran Burung Berjalan',
+        body: 'Pemutar aktif meski layar dikunci atau aplikasi diminimize',
+        payload: widget.payload,
+      ),
+    );
   }
 
   Future<void> _exitFullScreenAndWakelock() async {
+    unawaited(NotifService.instance.stopPlaybackForegroundService());
     await WakelockPlus.disable();
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   }
@@ -250,7 +281,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     if (offlinePath != null) {
       try {
-        final controller = VideoPlayerController.file(File(offlinePath));
+        final controller = VideoPlayerController.file(
+          File(offlinePath),
+          videoPlayerOptions: VideoPlayerOptions(
+            mixWithOthers: true,
+            allowBackgroundPlayback: true,
+          ),
+        );
         await controller.initialize();
         await controller.setLooping(true);
         await controller.play();
@@ -276,7 +313,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final directUrl = await _resolveDirectYoutubeStreamUrl(_videoId);
       if (directUrl != null && mounted) {
         try {
-          final controller = VideoPlayerController.networkUrl(Uri.parse(directUrl));
+          final controller = VideoPlayerController.networkUrl(
+            Uri.parse(directUrl),
+            videoPlayerOptions: VideoPlayerOptions(
+              mixWithOthers: true,
+              allowBackgroundPlayback: true,
+            ),
+          );
           await controller.initialize();
           await controller.setLooping(true);
           await controller.play();
@@ -654,9 +697,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _countdownTimer?.cancel();
     _fadeTimer?.cancel();
     _videoController?.dispose();
+    unawaited(NotifService.instance.stopPlaybackForegroundService());
     WakelockPlus.disable();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();

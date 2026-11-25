@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -128,6 +129,52 @@ class LicenseSession {
       };
 }
 
+class CatalogPreset {
+  final String id;
+  final String title;
+  final String species;
+  final String platform;
+  final String url;
+  final int recommendedPlayMin;
+  final int recommendedPauseMin;
+  final int recommendedFadeSec;
+
+  const CatalogPreset({
+    required this.id,
+    required this.title,
+    required this.species,
+    required this.platform,
+    required this.url,
+    this.recommendedPlayMin = 15,
+    this.recommendedPauseMin = 5,
+    this.recommendedFadeSec = 25,
+  });
+
+  factory CatalogPreset.fromJson(Map<String, dynamic> json) {
+    return CatalogPreset(
+      id: (json['id'] as String?) ?? '',
+      title: (json['title'] as String?) ?? 'Masteran Rekomendasi',
+      species: (json['species'] as String?) ?? 'Semua Burung Kicau',
+      platform: ((json['platform'] as String?) ?? 'youtube').toLowerCase(),
+      url: (json['url'] as String?) ?? '',
+      recommendedPlayMin: int.tryParse('${json['recommended_play_min'] ?? 15}') ?? 15,
+      recommendedPauseMin: int.tryParse('${json['recommended_pause_min'] ?? 5}') ?? 5,
+      recommendedFadeSec: int.tryParse('${json['recommended_fade_sec'] ?? 25}') ?? 25,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'species': species,
+        'platform': platform,
+        'url': url,
+        'recommended_play_min': recommendedPlayMin,
+        'recommended_pause_min': recommendedPauseMin,
+        'recommended_fade_sec': recommendedFadeSec,
+      };
+}
+
 class VerifyResult {
   final bool ok;
   final String message;
@@ -139,21 +186,26 @@ class ApiService {
   ApiService._();
   static final ApiService instance = ApiService._();
 
-  static const String baseUrl = 'http://limopancer.com/mendek/api.php';
-  static const String appVersion = '1.1.0';
+  static const String baseUrl = 'https://limopancer.com/mendek/api.php';
+  static const String appVersion = '2.0.0';
 
   static const String _prefDeviceId = 'mendek_device_id_v1';
   static const String _prefSession = 'mendek_license_session_v1';
   static const String _prefRemoteConfig = 'mendek_remote_config_v1';
+  static const String _prefCatalog = 'mendek_catalog_v1';
+  static const MethodChannel _alarmChannel =
+      MethodChannel('com.mendekarena.mendek_arena_masteran/alarm');
 
   SharedPreferences? _prefs;
   String _deviceId = '';
   LicenseSession? _session;
   RemoteConfig _remoteConfig = const RemoteConfig();
+  List<CatalogPreset> _catalog = const [];
 
   String get deviceId => _deviceId;
   LicenseSession? get session => _session;
   RemoteConfig get remoteConfig => _remoteConfig;
+  List<CatalogPreset> get catalog => _catalog;
   bool get hasValidSession => _session != null && _session!.key.isNotEmpty;
 
   String get _deviceLabel {
@@ -189,7 +241,68 @@ class ApiService {
       } catch (_) {}
     }
 
+    final rawCatalog = _prefs?.getString(_prefCatalog);
+    if (rawCatalog != null && rawCatalog.isNotEmpty) {
+      try {
+        final list = jsonDecode(rawCatalog) as List<dynamic>;
+        _catalog = list
+            .whereType<Map<String, dynamic>>()
+            .map(CatalogPreset.fromJson)
+            .where((c) => c.url.isNotEmpty)
+            .toList();
+      } catch (_) {}
+    }
+
     unawaited(fetchRemoteConfig());
+    unawaited(fetchCatalog());
+  }
+
+  Future<Map<String, String>> _readBatteryPingFields() async {
+    if (!Platform.isAndroid) return const {};
+    try {
+      final snap = await _alarmChannel
+          .invokeMapMethod<String, dynamic>('getBatterySnapshot');
+      if (snap == null) return const {};
+      final fields = <String, String>{};
+      if (snap['levelPct'] != null) {
+        fields['battery_pct'] = '${snap['levelPct']}';
+      }
+      if (snap['tempCelsius'] != null) {
+        fields['battery_temp'] = '${snap['tempCelsius']}';
+      }
+      if (snap['isCharging'] != null) {
+        fields['is_charging'] = snap['isCharging'] == true ? 'true' : 'false';
+      }
+      return fields;
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  Future<List<CatalogPreset>> fetchCatalog() async {
+    try {
+      final response = await http
+          .get(Uri.parse('$baseUrl?action=catalog'))
+          .timeout(const Duration(seconds: 7));
+      if (response.statusCode == 200) {
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        if (body['ok'] == true && body['catalog'] is List<dynamic>) {
+          final items = (body['catalog'] as List<dynamic>)
+              .whereType<Map<String, dynamic>>()
+              .map(CatalogPreset.fromJson)
+              .where((c) => c.url.isNotEmpty)
+              .toList();
+          _catalog = items;
+          await _prefs?.setString(
+            _prefCatalog,
+            jsonEncode(items.map((e) => e.toJson()).toList()),
+          );
+        }
+      }
+    } catch (_) {
+      // Gunakan katalog cache lokal saat offline
+    }
+    return _catalog;
   }
 
   Future<RemoteConfig> fetchRemoteConfig() async {
@@ -274,6 +387,7 @@ class ApiService {
   Future<bool> revalidateInBackground() async {
     if (_session == null) return false;
     try {
+      final batteryFields = await _readBatteryPingFields();
       final response = await http
           .post(
             Uri.parse(baseUrl),
@@ -281,6 +395,8 @@ class ApiService {
               'action': 'ping',
               'key': _session!.key,
               'device_id': _deviceId,
+              'app_version': appVersion,
+              ...batteryFields,
             },
           )
           .timeout(const Duration(seconds: 7));
@@ -296,6 +412,7 @@ class ApiService {
             jsonEncode(_remoteConfig.toJson()),
           );
         }
+        unawaited(fetchCatalog());
         return true;
       }
 
@@ -312,6 +429,7 @@ class ApiService {
   Future<void> sendMonitoringPing({String? playingNow}) async {
     if (_session == null) return;
     try {
+      final batteryFields = await _readBatteryPingFields();
       await http
           .post(
             Uri.parse(baseUrl),
@@ -319,8 +437,10 @@ class ApiService {
               'action': 'ping',
               'key': _session!.key,
               'device_id': _deviceId,
+              'app_version': appVersion,
               if (playingNow != null && playingNow.isNotEmpty)
                 'playing_now': playingNow,
+              ...batteryFields,
             },
           )
           .timeout(const Duration(seconds: 6));

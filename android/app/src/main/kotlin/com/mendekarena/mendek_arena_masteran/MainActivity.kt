@@ -62,7 +62,7 @@ class MainActivity : FlutterActivity() {
         if (intent.action == MasteranAlarmReceiver.ACTION_FIRE_ALARM) {
             val payload = intent.getStringExtra(MasteranAlarmReceiver.EXTRA_PAYLOAD)
             if (!payload.isNullOrEmpty()) {
-                MasteranAlarmReceiver.clearActiveAlarmNotification(this)
+                // Keep MasteranAlarmService alive until PlayerScreen transitions or stops
                 pendingAlarmPayload = payload
                 if (notifyFlutter && alarmChannel != null) {
                     alarmChannel?.invokeMethod("onAlarmTriggered", payload, object : MethodChannel.Result {
@@ -95,6 +95,21 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
                 "ping" -> {
                     result.success(true)
+                }
+
+                "getBatterySnapshot" -> {
+                    try {
+                        val snap = BatteryGuardHelper.readSnapshot(applicationContext)
+                        result.success(
+                            mapOf(
+                                "levelPct" to snap.levelPct,
+                                "isCharging" to snap.isCharging,
+                                "tempCelsius" to snap.tempCelsius
+                            )
+                        )
+                    } catch (_: Exception) {
+                        result.success(null)
+                    }
                 }
 
                 "scheduleWeeklyAlarm" -> {
@@ -175,7 +190,92 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "clearAlarmNotification" -> {
-                    MasteranAlarmReceiver.clearActiveAlarmNotification(applicationContext)
+                    MasteranAlarmReceiver.clearActiveAlarmNotification(applicationContext, forceStopService = false)
+                    result.success(true)
+                }
+                "startPlaybackForegroundService" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val title = args?.get("title") as? String ?: "Masteran Burung Berjalan"
+                    val body = args?.get("body") as? String ?: "Audio masteran aktif di latar belakang & lockscreen"
+                    val payload = args?.get("payload") as? String ?: ""
+                    val serviceIntent = Intent(applicationContext, MasteranAlarmService::class.java).apply {
+                        action = MasteranAlarmService.ACTION_START_KEEPALIVE
+                        putExtra(MasteranAlarmReceiver.EXTRA_TITLE, title)
+                        putExtra(MasteranAlarmReceiver.EXTRA_BODY, body)
+                        putExtra(MasteranAlarmReceiver.EXTRA_PAYLOAD, payload)
+                    }
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            applicationContext.startForegroundService(serviceIntent)
+                        } else {
+                            applicationContext.startService(serviceIntent)
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
+                "stopPlaybackForegroundService" -> {
+                    val stopIntent = Intent(applicationContext, MasteranAlarmService::class.java).apply {
+                        action = MasteranAlarmService.ACTION_STOP_SERVICE
+                    }
+                    try {
+                        applicationContext.startService(stopIntent)
+                    } catch (_: Exception) {
+                        MasteranAlarmReceiver.clearActiveAlarmNotification(applicationContext, forceStopService = true)
+                    }
+                    result.success(true)
+                }
+                "ensureBackgroundFallbackAudio" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val title = args?.get("title") as? String ?: "Masteran Burung Berjalan"
+                    val body = args?.get("body") as? String ?: "Audio masteran tetap berbunyi di latar belakang"
+                    val payload = args?.get("payload") as? String ?: ""
+                    val serviceIntent = Intent(applicationContext, MasteranAlarmService::class.java).apply {
+                        action = MasteranAlarmService.ACTION_ENSURE_BACKGROUND_AUDIO
+                        putExtra(MasteranAlarmReceiver.EXTRA_TITLE, title)
+                        putExtra(MasteranAlarmReceiver.EXTRA_BODY, body)
+                        putExtra(MasteranAlarmReceiver.EXTRA_PAYLOAD, payload)
+                    }
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            applicationContext.startForegroundService(serviceIntent)
+                        } else {
+                            applicationContext.startService(serviceIntent)
+                        }
+                        result.success(true)
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                }
+                "startStandbyService" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val title = args?.get("title") as? String ?: "Mendek Arena — Siaga Alarm"
+                    val body = args?.get("body") as? String ?: "Tetap berjalan di latar belakang meski aplikasi ditutup"
+                    val serviceIntent = Intent(applicationContext, MasteranAlarmService::class.java).apply {
+                        action = MasteranAlarmService.ACTION_START_STANDBY
+                        putExtra(MasteranAlarmReceiver.EXTRA_TITLE, title)
+                        putExtra(MasteranAlarmReceiver.EXTRA_BODY, body)
+                    }
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            applicationContext.startForegroundService(serviceIntent)
+                        } else {
+                            applicationContext.startService(serviceIntent)
+                        }
+                        result.success(true)
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                }
+                "stopStandbyService" -> {
+                    val serviceIntent = Intent(applicationContext, MasteranAlarmService::class.java).apply {
+                        action = MasteranAlarmService.ACTION_STOP_STANDBY
+                    }
+                    try {
+                        applicationContext.startService(serviceIntent)
+                    } catch (_: Exception) {
+                    }
                     result.success(true)
                 }
 
