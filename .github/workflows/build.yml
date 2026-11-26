@@ -1,4 +1,4 @@
-name: Build APK Release - Mendek Arena Masteran Burung v2
+name: Build APK Release - Mendek Arena Masteran Burung v3.3
 
 on:
   push:
@@ -8,7 +8,6 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,17 +25,23 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Generate Android Shell & Preserve Custom V2 Code
+      - name: Generate Android Shell & Preserve Custom V3 Code
         run: |
           mkdir -p /tmp/custom_android_backup
           cp android/app/src/main/AndroidManifest.xml /tmp/custom_android_backup/AndroidManifest.xml
           cp -r android/app/src/main/kotlin /tmp/custom_android_backup/kotlin
+          if [ -d android/app/src/main/res ]; then
+            cp -r android/app/src/main/res /tmp/custom_android_backup/res
+          fi
           cp android/app/build.gradle /tmp/custom_android_backup/build.gradle
           flutter create --org com.mendekarena --project-name mendek_arena_masteran --platforms android .
           sed -i 's/1.8.22/1.9.24/g' android/settings.gradle
           cp /tmp/custom_android_backup/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           rm -rf android/app/src/main/kotlin
           cp -r /tmp/custom_android_backup/kotlin android/app/src/main/kotlin
+          if [ -d /tmp/custom_android_backup/res ]; then
+            cp -r /tmp/custom_android_backup/res/* android/app/src/main/res/
+          fi
           cp /tmp/custom_android_backup/build.gradle android/app/build.gradle
           rm -f test/widget_test.dart
 
@@ -52,11 +57,11 @@ jobs:
       - name: Prepare Release Artifact
         run: |
           mkdir -p release-output
-          cp build/app/outputs/flutter-apk/app-release.apk release-output/mendek-arena-masteran-burung-v2.0.0.apk
+          cp build/app/outputs/flutter-apk/app-release.apk release-output/mendek-arena-masteran-burung-v3.3.0.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mendek-arena-masteran-burung-v2-apk
-          path: release-output/mendek-arena-masteran-burung-v2.0.0.apk
+          name: mendek-arena-masteran-burung-v3-apk
+          path: release-output/mendek-arena-masteran-burung-v3.3.0.apk
           retention-days: 30
