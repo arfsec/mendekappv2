@@ -479,7 +479,7 @@ class SocialService {
     final birdLine = (birdLabel != null && birdLabel.trim().isNotEmpty)
         ? '• Gacoan: $birdLabel\n'
         : '';
-    return '${birdLine}• Sumber Suara: $trackInfo\n'
+    return '$birdLine• Sumber Suara: $trackInfo\n'
         '• Jam Putar: ${schedule.timeRangeText} (${schedule.formattedDays})\n'
         '• Siklus: ${schedule.intervalSummary}\n'
         '• Fade-In Volume: ${schedule.startVolume}% → ${schedule.targetVolume}% (${schedule.fadeInSeconds} dtk)$ambientInfo';
