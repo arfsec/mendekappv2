@@ -224,7 +224,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_autoSyncTimer != null && _activeSyncIntervalSec == interval) {
       return;
     }
-    _autoSyncIntervalSec = interval;
+    _activeSyncIntervalSec = interval;
     _autoSyncTimer?.cancel();
     _autoSyncTimer = Timer.periodic(
       Duration(seconds: interval),
