@@ -52,6 +52,13 @@ class NotifService {
   static const String _channelDesc =
       'Alarm otomatis untuk membuka pemutar video masteran burung';
 
+  static const String _bmkgChannelId = 'mendek_bmkg_cuaca_esok_v1';
+  static const String _bmkgChannelName = 'Prakiraan Cuaca BMKG Esok';
+  static const String _bmkgChannelDesc =
+      'Info otomatis jam hujan dan jam panas besok dari BMKG sesuai wilayah HP';
+  static const int _bmkgInstantNotifId = 991001;
+  static const int _bmkgDailyNotifId = 991002;
+
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
 
@@ -115,6 +122,15 @@ class NotifService {
         enableVibration: true,
       );
       await androidPlugin.createNotificationChannel(channel);
+      const AndroidNotificationChannel bmkgChannel = AndroidNotificationChannel(
+        _bmkgChannelId,
+        _bmkgChannelName,
+        description: _bmkgChannelDesc,
+        importance: Importance.high,
+        playSound: true,
+        enableVibration: true,
+      );
+      await androidPlugin.createNotificationChannel(bmkgChannel);
     }
 
     _initialized = true;
@@ -484,6 +500,106 @@ class NotifService {
         await scheduleNotificationsFor(schedule);
       }
     }
+  }
+
+  Future<void> showBmkgTomorrowNotification({
+    required String title,
+    required String summaryBody,
+    required String bigBody,
+  }) async {
+    await init();
+    final AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+      _bmkgChannelId,
+      _bmkgChannelName,
+      channelDescription: _bmkgChannelDesc,
+      importance: Importance.high,
+      priority: Priority.high,
+      styleInformation: BigTextStyleInformation(
+        bigBody,
+        contentTitle: title,
+        summaryText: 'Prakiraan BMKG Besok',
+      ),
+      playSound: true,
+      enableVibration: true,
+    );
+    await _plugin.show(
+      _bmkgInstantNotifId,
+      title,
+      summaryBody,
+      NotificationDetails(android: androidDetails),
+      payload: 'bmkg_cuaca',
+    );
+  }
+
+  Future<void> scheduleDailyBmkgReminder({
+    required int hour,
+    required int minute,
+    required String title,
+    required String body,
+  }) async {
+    await init();
+    await _plugin.cancel(_bmkgDailyNotifId);
+
+    final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
+    tz.TZDateTime scheduled = tz.TZDateTime(
+      tz.local,
+      now.year,
+      now.month,
+      now.day,
+      hour,
+      minute,
+    );
+    if (!scheduled.isAfter(now)) {
+      scheduled = scheduled.add(const Duration(days: 1));
+    }
+
+    final AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+      _bmkgChannelId,
+      _bmkgChannelName,
+      channelDescription: _bmkgChannelDesc,
+      importance: Importance.high,
+      priority: Priority.high,
+      styleInformation: BigTextStyleInformation(
+        body,
+        contentTitle: title,
+        summaryText: 'Prakiraan BMKG Besok',
+      ),
+      playSound: true,
+      enableVibration: true,
+    );
+
+    try {
+      await _plugin.zonedSchedule(
+        _bmkgDailyNotifId,
+        title,
+        body,
+        scheduled,
+        NotificationDetails(android: androidDetails),
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation:
+            UILocalNotificationDateInterpretation.absoluteTime,
+        matchDateTimeComponents: DateTimeComponents.time,
+        payload: 'bmkg_cuaca',
+      );
+    } catch (_) {
+      await _plugin.zonedSchedule(
+        _bmkgDailyNotifId,
+        title,
+        body,
+        scheduled,
+        NotificationDetails(android: androidDetails),
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation:
+            UILocalNotificationDateInterpretation.absoluteTime,
+        matchDateTimeComponents: DateTimeComponents.time,
+        payload: 'bmkg_cuaca',
+      );
+    }
+  }
+
+  Future<void> cancelBmkgReminder() async {
+    await init();
+    await _plugin.cancel(_bmkgDailyNotifId);
   }
 
   void dispose() {

@@ -7,7 +7,7 @@ class DbService {
   static final DbService instance = DbService._();
 
   static const String _dbName = 'mendek_arena_masteran.db';
-  static const int _dbVersion = 3;
+  static const int _dbVersion = 4;
   static const String _tableName = 'schedules';
 
   Database? _database;
@@ -16,6 +16,14 @@ class DbService {
     if (_database != null) return _database!;
     _database = await _initDatabase();
     return _database!;
+  }
+
+  Future<void> _safeAddColumn(Database db, String columnDef) async {
+    try {
+      await db.execute('ALTER TABLE $_tableName ADD COLUMN $columnDef');
+    } catch (_) {
+      // Kolom sudah ada
+    }
   }
 
   Future<Database> _initDatabase() async {
@@ -42,22 +50,64 @@ class DbService {
             created_at INTEGER NOT NULL,
             play_minutes INTEGER NOT NULL DEFAULT 15,
             pause_minutes INTEGER NOT NULL DEFAULT 5,
-            local_file_path TEXT
+            local_file_path TEXT,
+            bird_id TEXT NOT NULL DEFAULT 'bird_default',
+            tracks_json TEXT NOT NULL DEFAULT '[]',
+            start_volume INTEGER NOT NULL DEFAULT 10,
+            target_volume INTEGER NOT NULL DEFAULT 85,
+            fade_in_seconds INTEGER NOT NULL DEFAULT 25,
+            ambient_therapy TEXT NOT NULL DEFAULT 'none',
+            ambient_volume INTEGER NOT NULL DEFAULT 20,
+            battery_guard_enabled INTEGER NOT NULL DEFAULT 1
           )
         ''');
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
-          await db.execute(
-            'ALTER TABLE $_tableName ADD COLUMN play_minutes INTEGER NOT NULL DEFAULT 15',
+          await _safeAddColumn(
+            db,
+            'play_minutes INTEGER NOT NULL DEFAULT 15',
           );
-          await db.execute(
-            'ALTER TABLE $_tableName ADD COLUMN pause_minutes INTEGER NOT NULL DEFAULT 5',
+          await _safeAddColumn(
+            db,
+            'pause_minutes INTEGER NOT NULL DEFAULT 5',
           );
         }
         if (oldVersion < 3) {
-          await db.execute(
-            'ALTER TABLE $_tableName ADD COLUMN local_file_path TEXT',
+          await _safeAddColumn(db, 'local_file_path TEXT');
+        }
+        if (oldVersion < 4) {
+          await _safeAddColumn(
+            db,
+            "bird_id TEXT NOT NULL DEFAULT 'bird_default'",
+          );
+          await _safeAddColumn(
+            db,
+            "tracks_json TEXT NOT NULL DEFAULT '[]'",
+          );
+          await _safeAddColumn(
+            db,
+            'start_volume INTEGER NOT NULL DEFAULT 10',
+          );
+          await _safeAddColumn(
+            db,
+            'target_volume INTEGER NOT NULL DEFAULT 85',
+          );
+          await _safeAddColumn(
+            db,
+            'fade_in_seconds INTEGER NOT NULL DEFAULT 25',
+          );
+          await _safeAddColumn(
+            db,
+            "ambient_therapy TEXT NOT NULL DEFAULT 'none'",
+          );
+          await _safeAddColumn(
+            db,
+            'ambient_volume INTEGER NOT NULL DEFAULT 20',
+          );
+          await _safeAddColumn(
+            db,
+            'battery_guard_enabled INTEGER NOT NULL DEFAULT 1',
           );
         }
       },
@@ -153,6 +203,7 @@ class DbService {
         createdAt: nowMs,
         playMinutes: 15,
         pauseMinutes: 5,
+        birdId: 'bird_default',
       ),
       Schedule(
         id: 'preset_siang_murai',
@@ -169,6 +220,7 @@ class DbService {
         createdAt: nowMs + 1,
         playMinutes: 20,
         pauseMinutes: 10,
+        birdId: 'bird_default',
       ),
       Schedule(
         id: 'preset_malam_istirahat',
@@ -185,6 +237,7 @@ class DbService {
         createdAt: nowMs + 2,
         playMinutes: 15,
         pauseMinutes: 5,
+        birdId: 'bird_default',
       ),
     ];
     for (final item in defaults) {

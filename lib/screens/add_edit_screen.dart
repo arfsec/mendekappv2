@@ -20,8 +20,15 @@ class AddEditResult {
 
 class AddEditScreen extends StatefulWidget {
   final Schedule? existingSchedule;
+  final String initialBirdId;
+  final List<BirdProfile> birdProfiles;
 
-  const AddEditScreen({super.key, this.existingSchedule});
+  const AddEditScreen({
+    super.key,
+    this.existingSchedule,
+    this.initialBirdId = 'bird_default',
+    this.birdProfiles = const [],
+  });
 
   @override
   State<AddEditScreen> createState() => _AddEditScreenState();
@@ -42,9 +49,19 @@ class _AddEditScreenState extends State<AddEditScreen> {
   late int _playMinutes;
   late int _pauseMinutes;
 
+  late String _selectedBirdId;
+  late List<PlaylistTrack> _playlistTracks;
+  late int _startVolume;
+  late int _targetVolume;
+  late int _fadeInSeconds;
+  late String _ambientTherapy;
+  late int _ambientVolume;
+  late bool _batteryGuardEnabled;
+
   ParsedVideoUrl? _detectedUrl;
   bool _isSaving = false;
   bool _isResolvingLink = false;
+  bool _isPickingLocal = false;
   bool _autoDownloadOffline = true;
 
   static const List<MapEntry<int, String>> _dayItems = [
@@ -55,6 +72,13 @@ class _AddEditScreenState extends State<AddEditScreen> {
     MapEntry(5, 'Jum'),
     MapEntry(6, 'Sab'),
     MapEntry(7, 'Min'),
+  ];
+
+  static const List<Map<String, String>> _therapyOptions = [
+    {'id': 'none', 'label': 'Tanpa Terapi'},
+    {'id': 'water', 'label': 'Air Mengalir'},
+    {'id': 'rain', 'label': 'Hujan Ringan'},
+    {'id': 'forest', 'label': 'Hutan Pagi'},
   ];
 
   bool get _isEditing => widget.existingSchedule != null;
@@ -80,7 +104,16 @@ class _AddEditScreenState extends State<AddEditScreen> {
       _playMinutes = existing.playMinutes > 0 ? existing.playMinutes : 15;
       _pauseMinutes = existing.pauseMinutes > 0 ? existing.pauseMinutes : 5;
       _detectedUrl = UrlHelper.parseUrl(existing.url);
-      _autoDownloadOffline = existing.platform == 'youtube' && !existing.isOfflineReady;
+      _autoDownloadOffline =
+          existing.platform == 'youtube' && !existing.isOfflineReady;
+      _selectedBirdId = existing.birdId;
+      _playlistTracks = [...existing.tracks];
+      _startVolume = existing.startVolume.clamp(0, 100);
+      _targetVolume = existing.targetVolume.clamp(10, 100);
+      _fadeInSeconds = existing.fadeInSeconds.clamp(0, 90);
+      _ambientTherapy = existing.ambientTherapy;
+      _ambientVolume = existing.ambientVolume.clamp(5, 80);
+      _batteryGuardEnabled = existing.batteryGuardEnabled;
     } else {
       _autoDownloadOffline = true;
       _startTime = const TimeOfDay(hour: 3, minute: 0);
@@ -90,6 +123,19 @@ class _AddEditScreenState extends State<AddEditScreen> {
       _useInterval = true;
       _playMinutes = 15;
       _pauseMinutes = 5;
+      _selectedBirdId = widget.initialBirdId;
+      _playlistTracks = [];
+      _startVolume = 10;
+      _targetVolume = 85;
+      _fadeInSeconds =
+          ApiService.instance.remoteConfig.fadeInDefaultSec.clamp(0, 90);
+      _ambientTherapy = 'none';
+      _ambientVolume = 20;
+      _batteryGuardEnabled = true;
+    }
+
+    if (_startVolume > _targetVolume) {
+      _startVolume = _targetVolume;
     }
 
     _urlController.addListener(_onUrlChanged);
@@ -123,6 +169,121 @@ class _AddEditScreenState extends State<AddEditScreen> {
         ),
       );
     }
+  }
+
+  Future<void> _pickLocalFile({bool addToPlaylist = false}) async {
+    if (_isPickingLocal) return;
+    setState(() => _isPickingLocal = true);
+    try {
+      final picked = await ApiService.instance.pickLocalMedia();
+      if (!mounted) return;
+      if (picked == null) {
+        setState(() => _isPickingLocal = false);
+        return;
+      }
+      final localUri = 'local://${picked.path}';
+      final cleanTitle = picked.name.replaceAll(RegExp(r'\.[^.]+$'), '');
+      if (addToPlaylist) {
+        setState(() {
+          _playlistTracks.add(
+            PlaylistTrack(
+              id: const Uuid().v4(),
+              title: cleanTitle.isNotEmpty ? cleanTitle : 'Masteran Lokal',
+              url: localUri,
+              platform: 'local',
+              videoId: picked.name,
+              localFilePath: picked.path,
+            ),
+          );
+          if (_nameController.text.trim().isEmpty) {
+            _nameController.text = cleanTitle;
+          }
+          if (_urlController.text.trim().isEmpty) {
+            _urlController.text = localUri;
+          }
+        });
+      } else {
+        setState(() {
+          _urlController.text = localUri;
+          _autoDownloadOffline = false;
+          if (_nameController.text.trim().isEmpty) {
+            _nameController.text = cleanTitle;
+          }
+        });
+        _onUrlChanged();
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'File lokal "${picked.name}" siap diputar 100% offline!',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Gagal memilih file lokal: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isPickingLocal = false);
+      }
+    }
+  }
+
+  Future<void> _addCurrentUrlToPlaylist() async {
+    final raw = _urlController.text.trim();
+    if (raw.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Tempel link atau pilih file lokal dulu sebelum masuk playlist.'),
+        ),
+      );
+      return;
+    }
+    setState(() => _isResolvingLink = true);
+    final resolved = await UrlHelper.resolveUrl(raw);
+    if (!mounted) return;
+    setState(() => _isResolvingLink = false);
+    if (resolved == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Link video tidak valid.')),
+      );
+      return;
+    }
+
+    final trackTitle = resolved.platform == 'local'
+        ? resolved.videoId.replaceAll(RegExp(r'\.[^.]+$'), '')
+        : '${resolved.platformLabel} • ${resolved.videoId}';
+    final alreadyExists = _playlistTracks.any(
+      (t) =>
+          t.originalUrlMatch(resolved.originalUrl) ||
+          (resolved.platform != 'local' &&
+              t.platform == resolved.platform &&
+              t.videoId == resolved.videoId),
+    );
+    if (alreadyExists) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Isian tersebut sudah ada di playlist.')),
+      );
+      return;
+    }
+
+    setState(() {
+      _playlistTracks.add(
+        PlaylistTrack(
+          id: const Uuid().v4(),
+          title: trackTitle,
+          url: resolved.originalUrl,
+          platform: resolved.platform,
+          videoId: resolved.videoId,
+          localFilePath: resolved.platform == 'local' ? resolved.embedUrl : null,
+        ),
+      );
+      _urlController.clear();
+      _detectedUrl = null;
+    });
   }
 
   Future<void> _resolveShortlinkInBackground(String raw) async {
@@ -201,31 +362,94 @@ class _AddEditScreenState extends State<AddEditScreen> {
       return;
     }
 
+    final rawInputUrl = _urlController.text.trim();
+    if (_playlistTracks.isEmpty && rawInputUrl.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Masukkan link YouTube/TikTok atau pilih file lokal HP.'),
+        ),
+      );
+      return;
+    }
+
     setState(() => _isSaving = true);
 
     try {
-      final resolved = await UrlHelper.resolveUrl(_urlController.text);
-      if (resolved == null) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Link video tidak valid.')),
+      final List<PlaylistTrack> finalTracks = [..._playlistTracks];
+      ParsedVideoUrl? primaryResolved;
+
+      if (rawInputUrl.isNotEmpty) {
+        primaryResolved = await UrlHelper.resolveUrl(rawInputUrl);
+        if (primaryResolved == null) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Link atau file media tidak valid.')),
+            );
+            setState(() => _isSaving = false);
+          }
+          return;
+        }
+
+        final hasInList = finalTracks.any(
+          (t) =>
+              t.url == primaryResolved!.originalUrl ||
+              (primaryResolved.platform != 'local' &&
+                  t.platform == primaryResolved.platform &&
+                  t.videoId == primaryResolved.videoId),
+        );
+        if (!hasInList) {
+          final existing = widget.existingSchedule;
+          final String? preservedOffline = (existing != null &&
+                  existing.platform == primaryResolved.platform &&
+                  existing.videoId == primaryResolved.videoId)
+              ? existing.localFilePath
+              : null;
+          finalTracks.insert(
+            0,
+            PlaylistTrack(
+              id: const Uuid().v4(),
+              title: primaryResolved.platform == 'local'
+                  ? primaryResolved.videoId.replaceAll(RegExp(r'\.[^.]+$'), '')
+                  : _nameController.text.trim(),
+              url: primaryResolved.originalUrl,
+              platform: primaryResolved.platform,
+              videoId: primaryResolved.videoId,
+              localFilePath: primaryResolved.platform == 'local'
+                  ? primaryResolved.embedUrl
+                  : preservedOffline,
+            ),
           );
+        }
+      }
+
+      if (finalTracks.isEmpty) {
+        if (mounted) {
           setState(() => _isSaving = false);
         }
         return;
       }
 
+      final primaryTrack = finalTracks.first;
       final existing = widget.existingSchedule;
-      final bool keepLocalFile = existing != null &&
-          existing.platform == resolved.platform &&
-          existing.videoId == resolved.videoId;
+      final bool keepExistingLocalFile = existing != null &&
+          existing.platform == primaryTrack.platform &&
+          existing.videoId == primaryTrack.videoId &&
+          (existing.localFilePath ?? '').isNotEmpty;
+
+      final String? resolvedLocalPath = primaryTrack.platform == 'local'
+          ? (primaryTrack.localFilePath ??
+              (primaryTrack.url.startsWith('local://')
+                  ? primaryTrack.url.substring('local://'.length)
+                  : primaryTrack.url))
+          : (primaryTrack.localFilePath ??
+              (keepExistingLocalFile ? existing.localFilePath : null));
 
       final schedule = Schedule(
         id: existing?.id ?? const Uuid().v4(),
         name: _nameController.text.trim(),
-        url: resolved.originalUrl,
-        platform: resolved.platform,
-        videoId: resolved.videoId,
+        url: primaryTrack.url,
+        platform: primaryTrack.platform,
+        videoId: primaryTrack.videoId,
         startHour: _startTime.hour,
         startMinute: _startTime.minute,
         endHour: _endTime.hour,
@@ -235,7 +459,15 @@ class _AddEditScreenState extends State<AddEditScreen> {
         createdAt: existing?.createdAt ?? DateTime.now().millisecondsSinceEpoch,
         playMinutes: _useInterval ? _playMinutes : 0,
         pauseMinutes: _useInterval ? _pauseMinutes : 0,
-        localFilePath: keepLocalFile ? existing.localFilePath : null,
+        localFilePath: resolvedLocalPath,
+        birdId: _selectedBirdId,
+        tracks: finalTracks,
+        startVolume: _startVolume.clamp(0, _targetVolume),
+        targetVolume: _targetVolume.clamp(5, 100),
+        fadeInSeconds: _fadeInSeconds,
+        ambientTherapy: _ambientTherapy,
+        ambientVolume: _ambientVolume,
+        batteryGuardEnabled: _batteryGuardEnabled,
       );
 
       if (_isEditing) {
@@ -247,7 +479,7 @@ class _AddEditScreenState extends State<AddEditScreen> {
       await NotifService.instance.scheduleNotificationsFor(schedule);
 
       final bool shouldAutoDownload = _autoDownloadOffline &&
-          resolved.platform == 'youtube' &&
+          primaryTrack.platform == 'youtube' &&
           !schedule.isOfflineReady &&
           ApiService.instance.remoteConfig.enableOfflineDownload;
 
@@ -282,6 +514,8 @@ class _AddEditScreenState extends State<AddEditScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final profiles = widget.birdProfiles;
+
     return Scaffold(
       appBar: AppBar(
         title: Text(
@@ -303,6 +537,52 @@ class _AddEditScreenState extends State<AddEditScreen> {
           child: ListView(
             padding: const EdgeInsets.all(20),
             children: [
+              if (profiles.length > 1) ...[
+                Container(
+                  margin: const EdgeInsets.only(bottom: 18),
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: const Color(0xFFE5E5EA)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Untuk Burung / Gacoan',
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF1C1C1E),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: profiles.map((b) {
+                          final selected = _selectedBirdId == b.id;
+                          return ChoiceChip(
+                            label: Text(b.name),
+                            selected: selected,
+                            selectedColor: _appleBlue,
+                            labelStyle: TextStyle(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 13,
+                              color: selected
+                                  ? Colors.white
+                                  : const Color(0xFF1C1C1E),
+                            ),
+                            onSelected: (_) =>
+                                setState(() => _selectedBirdId = b.id),
+                          );
+                        }).toList(),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
@@ -327,7 +607,7 @@ class _AddEditScreenState extends State<AddEditScreen> {
                       style: const TextStyle(fontSize: 17),
                       textInputAction: TextInputAction.next,
                       decoration: InputDecoration(
-                        hintText: 'Contoh: Cililin Tembakan Pagi',
+                        hintText: 'Contoh: Cililin + Kenari Pagi',
                         fillColor: const Color(0xFFF2F2F7),
                         filled: true,
                         border: OutlineInputBorder(
@@ -346,12 +626,14 @@ class _AddEditScreenState extends State<AddEditScreen> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Text(
-                          'Link Video (YouTube / TikTok)',
-                          style: TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w600,
-                            color: Color(0xFF1C1C1E),
+                        const Expanded(
+                          child: Text(
+                            'Sumber Audio / Video Masteran',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF1C1C1E),
+                            ),
                           ),
                         ),
                         TextButton.icon(
@@ -363,9 +645,9 @@ class _AddEditScreenState extends State<AddEditScreen> {
                             color: _appleBlue,
                           ),
                           label: Text(
-                            _isResolvingLink ? 'Memeriksa...' : 'Tempel Link',
+                            _isResolvingLink ? 'Memeriksa...' : 'Tempel',
                             style: TextStyle(
-                              fontSize: 14,
+                              fontSize: 13,
                               fontWeight: FontWeight.w600,
                               color: _appleBlue,
                             ),
@@ -376,13 +658,13 @@ class _AddEditScreenState extends State<AddEditScreen> {
                     const SizedBox(height: 6),
                     TextFormField(
                       controller: _urlController,
-                      style: const TextStyle(fontSize: 15),
+                      style: const TextStyle(fontSize: 14),
                       keyboardType: TextInputType.url,
                       maxLines: 2,
                       minLines: 1,
                       decoration: InputDecoration(
                         hintText:
-                            'https://youtu.be/... atau https://vt.tiktok.com/...',
+                            'Link YouTube / TikTok atau tekan tombol Pilih File HP',
                         fillColor: const Color(0xFFF2F2F7),
                         filled: true,
                         border: OutlineInputBorder(
@@ -390,13 +672,180 @@ class _AddEditScreenState extends State<AddEditScreen> {
                           borderSide: BorderSide.none,
                         ),
                       ),
-                      validator: UrlHelper.validateUrl,
+                      validator: (value) {
+                        if (_playlistTracks.isNotEmpty &&
+                            (value == null || value.trim().isEmpty)) {
+                          return null;
+                        }
+                        return UrlHelper.validateUrl(value);
+                      },
                     ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: _appleBlue,
+                              side: const BorderSide(color: Color(0xFF93C5FD)),
+                              minimumSize: const Size(0, 44),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            onPressed: _isPickingLocal
+                                ? null
+                                : () => _pickLocalFile(
+                                      addToPlaylist: _playlistTracks.isNotEmpty,
+                                    ),
+                            icon: const Icon(Icons.folder_open_rounded, size: 18),
+                            label: Text(
+                              _isPickingLocal
+                                  ? 'Menyalin...'
+                                  : 'Pilih MP3 / MP4 HP',
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: FilledButton.tonalIcon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: const Color(0xFFEFF6FF),
+                              foregroundColor: _appleBlue,
+                              minimumSize: const Size(0, 44),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            onPressed: _isResolvingLink
+                                ? null
+                                : _addCurrentUrlToPlaylist,
+                            icon: const Icon(Icons.playlist_add_rounded, size: 20),
+                            label: const Text(
+                              '+ ke Playlist',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_playlistTracks.isNotEmpty) ...[
+                      const SizedBox(height: 14),
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFF8FAFC),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(color: const Color(0xFFE2E8F0)),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  'Playlist Multi-Isian (${_playlistTracks.length} track)',
+                                  style: const TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w800,
+                                    color: Color(0xFF0F172A),
+                                  ),
+                                ),
+                                const Text(
+                                  'Rotasi otomatis',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: Color(0xFF64748B),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            ...List.generate(_playlistTracks.length, (idx) {
+                              final item = _playlistTracks[idx];
+                              return Container(
+                                margin: const EdgeInsets.only(bottom: 6),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 8,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(
+                                    color: const Color(0xFFE5E7EB),
+                                  ),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 6,
+                                        vertical: 2,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFFEFF6FF),
+                                        borderRadius: BorderRadius.circular(6),
+                                      ),
+                                      child: Text(
+                                        '${idx + 1}. ${item.platformLabel}',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w800,
+                                          color: _appleBlue,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Text(
+                                        item.title,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                          color: Color(0xFF1E293B),
+                                        ),
+                                      ),
+                                    ),
+                                    IconButton(
+                                      visualDensity: VisualDensity.compact,
+                                      icon: const Icon(
+                                        Icons.close_rounded,
+                                        size: 18,
+                                        color: Color(0xFFEF4444),
+                                      ),
+                                      onPressed: () {
+                                        setState(() {
+                                          _playlistTracks.removeAt(idx);
+                                        });
+                                      },
+                                    ),
+                                  ],
+                                ),
+                              );
+                            }),
+                          ],
+                        ),
+                      ),
+                    ],
                     if (_detectedUrl != null) ...[
                       const SizedBox(height: 12),
                       Container(
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 14, vertical: 10),
+                          horizontal: 14,
+                          vertical: 10,
+                        ),
                         decoration: BoxDecoration(
                           color: const Color(0xFFEFF6FF),
                           borderRadius: BorderRadius.circular(12),
@@ -407,15 +856,19 @@ class _AddEditScreenState extends State<AddEditScreen> {
                             Icon(
                               _detectedUrl!.platform == 'youtube'
                                   ? Icons.play_circle_fill_rounded
-                                  : Icons.music_note_rounded,
+                                  : (_detectedUrl!.platform == 'local'
+                                      ? Icons.audio_file_rounded
+                                      : Icons.music_note_rounded),
                               color: _appleBlue,
                             ),
                             const SizedBox(width: 10),
                             Expanded(
                               child: Text(
-                                _detectedUrl!.isShortLink
-                                    ? 'Terdeteksi: TikTok Shortlink (${_detectedUrl!.videoId}) • Siap diputar & diselesaikan otomatis'
-                                    : 'Terdeteksi: ${_detectedUrl!.platformLabel} (ID: ${_detectedUrl!.videoId})',
+                                _detectedUrl!.platform == 'local'
+                                    ? 'Terdeteksi: File Lokal HP (${_detectedUrl!.videoId}) • 100% Offline'
+                                    : (_detectedUrl!.isShortLink
+                                        ? 'Terdeteksi: TikTok Shortlink (${_detectedUrl!.videoId})'
+                                        : 'Terdeteksi: ${_detectedUrl!.platformLabel} (ID: ${_detectedUrl!.videoId})'),
                                 style: const TextStyle(
                                   color: Color(0xFF1E3A8A),
                                   fontSize: 13,
@@ -539,6 +992,216 @@ class _AddEditScreenState extends State<AddEditScreen> {
                 decoration: BoxDecoration(
                   color: Colors.white,
                   borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: const Color(0xFFE5E5EA)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Volume & Fade-In Halus (Anti Kaget)',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF1C1C1E),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Volume naik bertahap agar burung tidak stres saat masteran subuh menyala.',
+                      style: TextStyle(fontSize: 12, color: Color(0xFF6E6E73)),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Volume Awal',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          '$_startVolume%',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w800,
+                            color: _appleBlue,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Slider(
+                      value: _startVolume.toDouble(),
+                      min: 0,
+                      max: _targetVolume.toDouble(),
+                      divisions: _targetVolume > 5 ? _targetVolume ~/ 5 : 1,
+                      activeColor: _appleBlue,
+                      onChanged: (v) {
+                        setState(() {
+                          _startVolume = v.round();
+                        });
+                      },
+                    ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Volume Target',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          '$_targetVolume%',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w800,
+                            color: _appleBlue,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Slider(
+                      value: _targetVolume.toDouble(),
+                      min: 10,
+                      max: 100,
+                      divisions: 18,
+                      activeColor: _appleBlue,
+                      onChanged: (v) {
+                        setState(() {
+                          _targetVolume = v.round();
+                          if (_startVolume > _targetVolume) {
+                            _startVolume = _targetVolume;
+                          }
+                        });
+                      },
+                    ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Durasi Fade-In',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          _fadeInSeconds == 0 ? 'Instan' : '$_fadeInSeconds detik',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w800,
+                            color: _appleBlue,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Slider(
+                      value: _fadeInSeconds.toDouble(),
+                      min: 0,
+                      max: 90,
+                      divisions: 18,
+                      activeColor: _appleBlue,
+                      onChanged: (v) => setState(() => _fadeInSeconds = v.round()),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: _ambientTherapy != 'none'
+                        ? const Color(0xFF93C5FD)
+                        : const Color(0xFFE5E5EA),
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Suara Terapi Alam Latar (Relaksasi)',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF1C1C1E),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Putar suara alam lembut di belakang audio masteran tanpa kuota.',
+                      style: TextStyle(fontSize: 12, color: Color(0xFF6E6E73)),
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _therapyOptions.map((opt) {
+                        final id = opt['id']!;
+                        final label = opt['label']!;
+                        final selected = _ambientTherapy == id;
+                        return ChoiceChip(
+                          label: Text(label),
+                          selected: selected,
+                          selectedColor: _appleBlue,
+                          labelStyle: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: selected
+                                ? Colors.white
+                                : const Color(0xFF1C1C1E),
+                          ),
+                          onSelected: (_) =>
+                              setState(() => _ambientTherapy = id),
+                        );
+                      }).toList(),
+                    ),
+                    if (_ambientTherapy != 'none') ...[
+                      const SizedBox(height: 10),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text(
+                            'Volume Terapi Alam',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          Text(
+                            '$_ambientVolume%',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w800,
+                              color: _appleBlue,
+                            ),
+                          ),
+                        ],
+                      ),
+                      Slider(
+                        value: _ambientVolume.toDouble(),
+                        min: 5,
+                        max: 80,
+                        divisions: 15,
+                        activeColor: _appleBlue,
+                        onChanged: (v) =>
+                            setState(() => _ambientVolume = v.round()),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(18),
                   border: Border.all(
                     color: _useInterval
                         ? const Color(0xFF93C5FD)
@@ -550,25 +1213,23 @@ class _AddEditScreenState extends State<AddEditScreen> {
                   children: [
                     Row(
                       children: [
-                        Expanded(
+                        const Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              const Text(
-                                'Jeda Otomatis (Istirahat Burung)',
+                              Text(
+                                'Jeda Putar Otomatis (Interval)',
                                 style: TextStyle(
                                   fontSize: 16,
-                                  fontWeight: FontWeight.bold,
+                                  fontWeight: FontWeight.w600,
                                   color: Color(0xFF1C1C1E),
                                 ),
                               ),
-                              const SizedBox(height: 2),
+                              SizedBox(height: 2),
                               Text(
-                                _useInterval
-                                    ? 'Setiap putar $_playMinutes menit, jeda $_pauseMinutes menit'
-                                    : 'Video diputar terus tanpa jeda hingga jam selesai',
-                                style: const TextStyle(
-                                  fontSize: 14,
+                                'Putar masteran lalu diam agar burung tidak stres.',
+                                style: TextStyle(
+                                  fontSize: 13,
                                   color: Color(0xFF6E6E73),
                                 ),
                               ),
@@ -578,22 +1239,12 @@ class _AddEditScreenState extends State<AddEditScreen> {
                         CupertinoSwitch(
                           value: _useInterval,
                           activeColor: _appleBlue,
-                          onChanged: (val) =>
-                              setState(() => _useInterval = val),
+                          onChanged: (val) => setState(() => _useInterval = val),
                         ),
                       ],
                     ),
                     if (_useInterval) ...[
                       const Divider(height: 24, color: Color(0xFFE5E5EA)),
-                      const Text(
-                        'Pilihan Cepat:',
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: Color(0xFF3A3A3C),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
                       Wrap(
                         spacing: 8,
                         runSpacing: 8,
@@ -746,6 +1397,40 @@ class _AddEditScreenState extends State<AddEditScreen> {
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(
+                                'Proteksi Panas & Layar OLED',
+                                style: TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                  color: Color(0xFF1C1C1E),
+                                ),
+                              ),
+                              SizedBox(height: 2),
+                              Text(
+                                'Redupkan layar otomatis saat HP panas atau baterai penuh di cas.',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Color(0xFF6E6E73),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        CupertinoSwitch(
+                          value: _batteryGuardEnabled,
+                          activeColor: _appleBlue,
+                          onChanged: (val) =>
+                              setState(() => _batteryGuardEnabled = val),
+                        ),
+                      ],
+                    ),
+                    const Divider(height: 24, color: Color(0xFFE5E5EA)),
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
                                 'Aktifkan Jadwal Ini',
                                 style: TextStyle(
                                   fontSize: 16,
@@ -755,7 +1440,7 @@ class _AddEditScreenState extends State<AddEditScreen> {
                               ),
                               SizedBox(height: 2),
                               Text(
-                                'Video akan otomatis diputar pada jam yang ditentukan.',
+                                'Masteran akan otomatis diputar pada jam yang ditentukan.',
                                 style: TextStyle(
                                   fontSize: 14,
                                   color: Color(0xFF6E6E73),
@@ -804,6 +1489,12 @@ class _AddEditScreenState extends State<AddEditScreen> {
         ),
       ),
     );
+  }
+}
+
+extension on PlaylistTrack {
+  bool originalUrlMatch(String otherUrl) {
+    return url.trim() == otherUrl.trim();
   }
 }
 

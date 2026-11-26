@@ -1,0 +1,15 @@
+{
+  "app_name": "Mendek Arena",
+  "hero_title": "Masteran Burung Otomatis",
+  "hero_subtitle": "Jadwal Harian, Cuaca BMKG Besok & Komunitas Kicau",
+  "announcement": "Semangat kicau mania! Info terbaru otomatis tersinkron tanpa install ulang.",
+  "accent_color": "#007AFF",
+  "enable_offline_download": true,
+  "enable_cloud_anim": true,
+  "enable_social_feed": true,
+  "sync_interval_sec": 90,
+  "ota_revision": 1,
+  "min_version": "3.3.0",
+  "apk_download_url": "",
+  "live_modules": []
+}

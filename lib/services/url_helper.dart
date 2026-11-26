@@ -1,7 +1,7 @@
 import 'package:http/http.dart' as http;
 
 class ParsedVideoUrl {
-  final String platform; // 'youtube' atau 'tiktok'
+  final String platform; // 'youtube', 'tiktok', atau 'local'
   final String videoId;
   final String originalUrl;
   final String embedUrl;
@@ -15,7 +15,11 @@ class ParsedVideoUrl {
     this.isShortLink = false,
   });
 
-  String get platformLabel => platform == 'tiktok' ? 'TikTok' : 'YouTube';
+  String get platformLabel {
+    if (platform == 'tiktok') return 'TikTok';
+    if (platform == 'local') return 'File HP';
+    return 'YouTube';
+  }
 }
 
 class UrlHelper {
@@ -44,9 +48,34 @@ class UrlHelper {
     caseSensitive: false,
   );
 
+  static bool isAudioOnlyPath(String pathOrUrl) {
+    final lower = pathOrUrl.trim().toLowerCase();
+    return lower.endsWith('.mp3') ||
+        lower.endsWith('.m4a') ||
+        lower.endsWith('.wav') ||
+        lower.endsWith('.aac') ||
+        lower.endsWith('.ogg') ||
+        lower.endsWith('.flac') ||
+        lower.endsWith('.opus');
+  }
+
   static ParsedVideoUrl? parseUrl(String rawUrl) {
     final trimmed = rawUrl.trim();
     if (trimmed.isEmpty) return null;
+
+    if (trimmed.startsWith('local://') || trimmed.startsWith('/')) {
+      final path = trimmed.startsWith('local://')
+          ? trimmed.substring('local://'.length)
+          : trimmed;
+      final fileName = path.split('/').where((s) => s.isNotEmpty).lastOrNull ??
+          'masteran_lokal';
+      return ParsedVideoUrl(
+        platform: 'local',
+        videoId: fileName,
+        originalUrl: trimmed,
+        embedUrl: path,
+      );
+    }
 
     final normalized =
         trimmed.startsWith('http://') || trimmed.startsWith('https://')
@@ -114,7 +143,7 @@ class UrlHelper {
 
   static Future<ParsedVideoUrl?> resolveUrl(String rawUrl) async {
     final initial = parseUrl(rawUrl);
-    if (initial == null || !initial.isShortLink) {
+    if (initial == null || initial.platform == 'local' || !initial.isShortLink) {
       return initial;
     }
 
@@ -153,7 +182,6 @@ class UrlHelper {
           continue;
         }
 
-        // Cek body HTML apabila canonical / videoId disematkan tanpa redirect HTTP
         final body = await streamed.stream.bytesToString();
         final bodyMatch = RegExp(
           r'https?:\/\/(?:www\.|m\.)?tiktok\.com\/(?:@[^\/\s"\\]+\/)?video\/(\d+)',
@@ -183,14 +211,17 @@ class UrlHelper {
   static String? validateUrl(String? rawUrl) {
     final value = (rawUrl ?? '').trim();
     if (value.isEmpty) {
-      return 'Link video YouTube atau TikTok wajib diisi.';
+      return 'Link video YouTube/TikTok atau file lokal HP wajib diisi.';
+    }
+    if (value.startsWith('local://') || value.startsWith('/')) {
+      return null;
     }
     final normalized = value.startsWith('http://') || value.startsWith('https://')
         ? value
         : 'https://$value';
 
     if (parseUrl(normalized) == null) {
-      return 'Link harus berasal dari YouTube (watch, youtu.be, shorts) atau TikTok (vt.tiktok.com, @user/video/ID).';
+      return 'Link harus berasal dari YouTube, TikTok, atau pilih file MP3/MP4 lokal HP.';
     }
     return null;
   }

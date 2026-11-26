@@ -3,10 +3,11 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
-import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+import '../models/schedule.dart';
 import '../services/api_service.dart';
 import '../services/db_service.dart';
 import '../services/notif_service.dart';
@@ -35,6 +36,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   VideoPlayerController? _videoController;
   Timer? _countdownTimer;
   Timer? _fadeTimer;
+  Timer? _batteryGuardTimer;
 
   String _scheduleId = '';
   String _rawUrl = '';
@@ -46,6 +48,22 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   int _endMinute = 0;
   int _playMinutes = 0;
   int _pauseMinutes = 0;
+
+  List<PlaylistTrack> _tracks = const [];
+  int _currentTrackIndex = 0;
+  int _startVolume = 10;
+  int _targetVolume = 85;
+  int _fadeInSeconds = 25;
+  String _ambientTherapy = 'none';
+  int _ambientVolume = 20;
+  bool _batteryGuardEnabled = true;
+
+  bool _isAudioOnlyCurrent = false;
+  bool _isOledDimMode = false;
+  bool _manualOledOverride = false;
+  bool _isAdvancingTrack = false;
+  BatterySnapshotData? _batterySnapshot;
+  String? _batteryAlertText;
 
   DateTime? _targetEndTime;
   Duration _remaining = Duration.zero;
@@ -60,6 +78,26 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   bool get _hasInterval => _playMinutes > 0 && _pauseMinutes > 0;
   Color get _accent => ApiService.instance.remoteConfig.accentColor;
 
+  String get _currentTrackTitle {
+    if (_tracks.isNotEmpty && _currentTrackIndex < _tracks.length) {
+      return _tracks[_currentTrackIndex].title;
+    }
+    return widget.scheduleName ?? 'Masteran $_platformLabel';
+  }
+
+  String get _ambientDisplayName {
+    switch (_ambientTherapy) {
+      case 'water':
+        return 'Air Mengalir';
+      case 'rain':
+        return 'Hujan Ringan';
+      case 'forest':
+        return 'Hutan Pagi';
+      default:
+        return '';
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -70,7 +108,9 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused && !_isOfflinePlayback && !_isPausedPhase) {
+    if (state == AppLifecycleState.paused &&
+        !_isOfflinePlayback &&
+        !_isPausedPhase) {
       unawaited(
         NotifService.instance.ensureBackgroundFallbackAudio(
           title: widget.scheduleName ?? 'Masteran Burung Berjalan',
@@ -102,6 +142,8 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   }
 
   Future<void> _exitFullScreenAndWakelock() async {
+    unawaited(ApiService.instance.stopAmbientTherapy());
+    unawaited(ApiService.instance.setScreenDim(false));
     unawaited(NotifService.instance.stopPlaybackForegroundService());
     await WakelockPlus.disable();
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -139,7 +181,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       setState(() {
         _hasError = true;
         _isLoading = false;
-        _errorMessage = 'URL video tidak dikenali: $_rawUrl';
+        _errorMessage = 'URL atau file media tidak dikenali: $_rawUrl';
       });
       return;
     }
@@ -183,7 +225,6 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     _setupPlayback(parsed, needsDbExpiryCheck: needsDbExpiryCheck);
   }
 
-
   Future<String?> _resolveDirectYoutubeStreamUrl(String videoId) async {
     final yt = YoutubeExplode();
     try {
@@ -204,9 +245,9 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
 
   void _startVolumeFadeInTimer(VideoPlayerController? controller) {
     _fadeTimer?.cancel();
-    const double start = 0.10;
-    const double target = 0.85;
-    final int durationSec = ApiService.instance.remoteConfig.fadeInDefaultSec;
+    final double start = (_startVolume / 100.0).clamp(0.0, 1.0);
+    final double target = (_targetVolume / 100.0).clamp(0.05, 1.0);
+    final int durationSec = _fadeInSeconds;
     if (durationSec <= 0) {
       controller?.setVolume(target);
       return;
@@ -223,8 +264,81 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     });
   }
 
+  void _syncAmbientTherapyState({required bool playing}) {
+    if (_ambientTherapy == 'none' || !playing) {
+      unawaited(ApiService.instance.stopAmbientTherapy());
+    } else {
+      unawaited(
+        ApiService.instance.startAmbientTherapy(
+          _ambientTherapy,
+          _ambientVolume,
+        ),
+      );
+    }
+  }
+
+  void _startBatteryGuardPolling() {
+    _batteryGuardTimer?.cancel();
+    unawaited(_pollBatteryStatus());
+    _batteryGuardTimer = Timer.periodic(
+      const Duration(seconds: 20),
+      (_) => unawaited(_pollBatteryStatus()),
+    );
+  }
+
+  Future<void> _pollBatteryStatus() async {
+    final snap = await ApiService.instance.getBatterySnapshot();
+    if (!mounted || snap == null) return;
+
+    final cfg = ApiService.instance.remoteConfig;
+    String? alert;
+    bool shouldAutoDim = false;
+    bool severeOverheat = false;
+
+    if (_batteryGuardEnabled) {
+      if (snap.tempCelsius >= cfg.batteryGuardMaxTempC + 3) {
+        alert =
+            'HP sangat panas (${snap.tempCelsius.toStringAsFixed(1)}°C) — Jeda otomatis!';
+        shouldAutoDim = true;
+        severeOverheat = true;
+      } else if (snap.tempCelsius >= cfg.batteryGuardMaxTempC) {
+        alert =
+            'Suhu hangat (${snap.tempCelsius.toStringAsFixed(1)}°C) — Layar diredupkan OLED';
+        shouldAutoDim = true;
+      } else if (snap.isCharging && snap.levelPct >= cfg.batteryGuardDefaultPct) {
+        alert =
+            'Baterai penuh (${snap.levelPct}%) saat dicas — Layar OLED Hemat Daya';
+        shouldAutoDim = true;
+      }
+    }
+
+    setState(() {
+      _batterySnapshot = snap;
+      _batteryAlertText = alert;
+    });
+
+    if (shouldAutoDim && !_isOledDimMode) {
+      await _setOledDimMode(true, isAutoTriggered: true);
+    }
+
+    if (severeOverheat && !_isPausedPhase && _hasInterval) {
+      _enterPausePhase();
+    }
+  }
+
+  Future<void> _setOledDimMode(bool enabled, {bool isAutoTriggered = false}) async {
+    if (!isAutoTriggered) {
+      _manualOledOverride = enabled;
+    }
+    await ApiService.instance.setScreenDim(enabled);
+    if (!mounted) return;
+    setState(() {
+      _isOledDimMode = enabled;
+    });
+  }
+
   Future<void> _setupPlayback(
-    ParsedVideoUrl parsed, {
+    ParsedVideoUrl initialParsed, {
     bool needsDbExpiryCheck = false,
   }) async {
     final sched = _scheduleId.isNotEmpty
@@ -232,6 +346,29 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         : null;
 
     if (!mounted) return;
+
+    if (sched != null) {
+      _tracks = sched.effectiveTracks;
+      _startVolume = sched.startVolume;
+      _targetVolume = sched.targetVolume;
+      _fadeInSeconds = sched.fadeInSeconds;
+      _ambientTherapy = sched.ambientTherapy;
+      _ambientVolume = sched.ambientVolume;
+      _batteryGuardEnabled = sched.batteryGuardEnabled;
+    } else {
+      _tracks = [
+        PlaylistTrack(
+          id: 'single',
+          title: widget.scheduleName ?? 'Masteran $_platformLabel',
+          url: initialParsed.originalUrl,
+          platform: initialParsed.platform,
+          videoId: initialParsed.videoId,
+          localFilePath:
+              initialParsed.platform == 'local' ? initialParsed.embedUrl : null,
+        ),
+      ];
+      _fadeInSeconds = ApiService.instance.remoteConfig.fadeInDefaultSec;
+    }
 
     if (needsDbExpiryCheck) {
       final now = DateTime.now();
@@ -263,24 +400,122 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       }
     }
 
+    _startBatteryGuardPolling();
+    _syncAmbientTherapyState(playing: true);
+
+    await _loadTrackAtIndex(0);
+  }
+
+  void _onVideoTickAdvance() {
+    final ctrl = _videoController;
+    if (ctrl == null || _isAdvancingTrack || _tracks.length <= 1) return;
+    final val = ctrl.value;
+    if (!val.isInitialized || val.duration <= Duration.zero) return;
+    final remainingMs = (val.duration - val.position).inMilliseconds;
+    if (remainingMs <= 350 && !val.isPlaying) {
+      _isAdvancingTrack = true;
+      unawaited(_playNextTrack());
+    }
+  }
+
+  Future<void> _playNextTrack() async {
+    if (_tracks.length <= 1 || !mounted) return;
+    final nextIdx = (_currentTrackIndex + 1) % _tracks.length;
+    await _loadTrackAtIndex(nextIdx);
+  }
+
+  Future<void> _playPrevTrack() async {
+    if (_tracks.length <= 1 || !mounted) return;
+    final prevIdx = (_currentTrackIndex - 1 + _tracks.length) % _tracks.length;
+    await _loadTrackAtIndex(prevIdx);
+  }
+
+  Future<void> _disposeActiveVideoController() async {
+    final oldCtrl = _videoController;
+    if (oldCtrl != null) {
+      oldCtrl.removeListener(_onVideoTickAdvance);
+      _videoController = null;
+      try {
+        await oldCtrl.pause();
+        await oldCtrl.dispose();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _loadTrackAtIndex(int index) async {
+    if (_tracks.isEmpty || !mounted) return;
+    _isAdvancingTrack = false;
+    final safeIdx = index.clamp(0, _tracks.length - 1);
+    final track = _tracks[safeIdx];
+
+    final parsed = UrlHelper.parseUrl(track.url);
+    if (parsed == null) {
+      if (mounted) {
+        setState(() {
+          _hasError = true;
+          _isLoading = false;
+          _errorMessage = 'Track tidak valid: ${track.title}';
+        });
+      }
+      return;
+    }
+
+    await _disposeActiveVideoController();
+    if (!mounted) return;
+
+    setState(() {
+      _currentTrackIndex = safeIdx;
+      _rawUrl = parsed.originalUrl;
+      _platform = parsed.platform;
+      _videoId = parsed.videoId;
+      _platformLabel = parsed.platformLabel;
+      _embedUrl = parsed.embedUrl;
+      _isOfflinePlayback = false;
+      _isAudioOnlyCurrent = false;
+      _isLoading = true;
+      _hasError = false;
+      _errorMessage = null;
+    });
+
     unawaited(
       ApiService.instance.sendMonitoringPing(
-        playingNow: widget.scheduleName ?? '$_platformLabel ($_videoId)',
+        playingNow: '${widget.scheduleName ?? track.title} (${safeIdx + 1}/${_tracks.length})',
       ),
     );
 
-    // 1. Cek apakah sudah tersedia file MP4 offline di memori HP
+    final bool loopSingle = _tracks.length == 1;
+
+    // 1. Cek file lokal HP atau file MP4 offline YouTube
     String? offlinePath;
-    final String? localPath = sched?.localFilePath;
-    if (localPath != null && await File(localPath).exists()) {
-      offlinePath = localPath;
+    if (track.platform == 'local') {
+      final candidate = track.localFilePath ?? parsed.embedUrl;
+      if (candidate.isNotEmpty && await File(candidate).exists()) {
+        offlinePath = candidate;
+      } else {
+        if (mounted) {
+          setState(() {
+            _hasError = true;
+            _isLoading = false;
+            _errorMessage = 'File lokal tidak ditemukan di HP: ${track.title}';
+          });
+        }
+        return;
+      }
+    } else {
+      final localPath = track.localFilePath;
+      if (localPath != null && await File(localPath).exists()) {
+        offlinePath = localPath;
+      }
+      offlinePath ??= await OfflineService.instance.getExistingLocalPath(
+        parsed.videoId,
+      );
     }
-    offlinePath ??= await OfflineService.instance.getExistingLocalPath(_videoId);
 
     if (!mounted) return;
 
     if (offlinePath != null) {
       try {
+        final isAudio = UrlHelper.isAudioOnlyPath(offlinePath);
         final controller = VideoPlayerController.file(
           File(offlinePath),
           videoPlayerOptions: VideoPlayerOptions(
@@ -289,7 +524,10 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
           ),
         );
         await controller.initialize();
-        await controller.setLooping(true);
+        await controller.setLooping(loopSingle);
+        if (!loopSingle) {
+          controller.addListener(_onVideoTickAdvance);
+        }
         await controller.play();
         _startVolumeFadeInTimer(controller);
         if (!mounted) {
@@ -299,18 +537,28 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         setState(() {
           _videoController = controller;
           _isOfflinePlayback = true;
+          _isAudioOnlyCurrent = isAudio;
           _isLoading = false;
           _hasError = false;
         });
         return;
       } catch (_) {
-        // Jika file korup, fallback ke pemutaran online
+        if (track.platform == 'local') {
+          if (mounted) {
+            setState(() {
+              _hasError = true;
+              _isLoading = false;
+              _errorMessage = 'Format audio/video lokal gagal diputar.';
+            });
+          }
+          return;
+        }
       }
     }
 
-    // 1b. Native YouTube stream via youtube_explode_dart agar tembus lockscreen
-    if (_platform == 'youtube' && _videoId.isNotEmpty) {
-      final directUrl = await _resolveDirectYoutubeStreamUrl(_videoId);
+    // 2. Native YouTube stream via youtube_explode_dart agar tembus lockscreen
+    if (parsed.platform == 'youtube' && parsed.videoId.isNotEmpty) {
+      final directUrl = await _resolveDirectYoutubeStreamUrl(parsed.videoId);
       if (directUrl != null && mounted) {
         try {
           final controller = VideoPlayerController.networkUrl(
@@ -321,7 +569,10 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
             ),
           );
           await controller.initialize();
-          await controller.setLooping(true);
+          await controller.setLooping(loopSingle);
+          if (!loopSingle) {
+            controller.addListener(_onVideoTickAdvance);
+          }
           await controller.play();
           _startVolumeFadeInTimer(controller);
           if (!mounted) {
@@ -331,6 +582,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
           setState(() {
             _videoController = controller;
             _isOfflinePlayback = true;
+            _isAudioOnlyCurrent = false;
             _isLoading = false;
             _hasError = false;
           });
@@ -339,7 +591,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       }
     }
 
-    // 2. Jika link TikTok shortlink (vt.tiktok.com), selesaikan redirect lebih dulu
+    // 3. Jika TikTok shortlink, selesaikan redirect lebih dulu
     if (parsed.isShortLink) {
       final resolved = await UrlHelper.resolveUrl(_rawUrl);
       if (!mounted) return;
@@ -349,7 +601,9 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       }
     }
 
-    _initWebView();
+    if (_webViewController == null) {
+      _initWebView();
+    }
     _loadEmbedVideo();
   }
 
@@ -608,6 +862,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       _isLoading = false;
       _hasError = false;
     });
+    _syncAmbientTherapyState(playing: false);
     if (_isOfflinePlayback) {
       _videoController?.pause();
     } else {
@@ -624,8 +879,14 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       _isLoading = !_isOfflinePlayback;
       _hasError = false;
     });
+    _syncAmbientTherapyState(playing: true);
+    if (_tracks.length > 1) {
+      unawaited(_playNextTrack());
+      return;
+    }
     if (_isOfflinePlayback) {
       _videoController?.play();
+      _startVolumeFadeInTimer(_videoController);
     } else {
       _loadEmbedVideo();
     }
@@ -675,7 +936,8 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   Future<void> _stopAndClose() async {
     _countdownTimer?.cancel();
     _fadeTimer?.cancel();
-    await _videoController?.pause();
+    _batteryGuardTimer?.cancel();
+    await _disposeActiveVideoController();
     await _exitFullScreenAndWakelock();
     if (mounted) {
       Navigator.of(context).pop();
@@ -700,7 +962,11 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     WidgetsBinding.instance.removeObserver(this);
     _countdownTimer?.cancel();
     _fadeTimer?.cancel();
+    _batteryGuardTimer?.cancel();
+    _videoController?.removeListener(_onVideoTickAdvance);
     _videoController?.dispose();
+    unawaited(ApiService.instance.stopAmbientTherapy());
+    unawaited(ApiService.instance.setScreenDim(false));
     unawaited(NotifService.instance.stopPlaybackForegroundService());
     WakelockPlus.disable();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -711,6 +977,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   Widget build(BuildContext context) {
     final endText =
         '${_endHour.toString().padLeft(2, '0')}:${_endMinute.toString().padLeft(2, '0')}';
+    final snap = _batterySnapshot;
 
     return PopScope(
       canPop: false,
@@ -721,377 +988,706 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       },
       child: Scaffold(
         backgroundColor: Colors.black,
-        body: SafeArea(
-          child: Column(
-            children: [
-              Container(
-                width: double.infinity,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                color: const Color(0xFF0F172A),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            widget.scheduleName ?? 'Masteran $_platformLabel',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
+        body: Stack(
+          children: [
+            SafeArea(
+              child: Column(
+                children: [
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 10,
+                    ),
+                    color: const Color(0xFF0F172A),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    widget.scheduleName ??
+                                        'Masteran $_platformLabel',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 17,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Wrap(
+                                    spacing: 6,
+                                    runSpacing: 4,
+                                    crossAxisAlignment:
+                                        WrapCrossAlignment.center,
+                                    children: [
+                                      if (_isOfflinePlayback)
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 6,
+                                            vertical: 2,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: _accent,
+                                            borderRadius:
+                                                BorderRadius.circular(6),
+                                          ),
+                                          child: Text(
+                                            _platform == 'local'
+                                                ? 'FILE HP'
+                                                : 'OFFLINE',
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.w800,
+                                            ),
+                                          ),
+                                        ),
+                                      if (_tracks.length > 1)
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 6,
+                                            vertical: 2,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF1E293B),
+                                            borderRadius:
+                                                BorderRadius.circular(6),
+                                            border: Border.all(
+                                              color: const Color(0xFF475569),
+                                            ),
+                                          ),
+                                          child: Text(
+                                            'Track ${_currentTrackIndex + 1}/${_tracks.length}',
+                                            style: const TextStyle(
+                                              color: Color(0xFF7DD3FC),
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.w800,
+                                            ),
+                                          ),
+                                        ),
+                                      if (_ambientTherapy != 'none')
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 6,
+                                            vertical: 2,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF064E3B),
+                                            borderRadius:
+                                                BorderRadius.circular(6),
+                                          ),
+                                          child: Text(
+                                            'Terapi: $_ambientDisplayName',
+                                            style: const TextStyle(
+                                              color: Color(0xFFA7F3D0),
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ),
+                                      Text(
+                                        '$_platformLabel • s/d $endText',
+                                        style: const TextStyle(
+                                          color: Color(0xFFBAE6FD),
+                                          fontSize: 13,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
                             ),
-                          ),
-                          const SizedBox(height: 2),
-                          Row(
-                            children: [
-                              if (_isOfflinePlayback)
+                            const SizedBox(width: 8),
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
                                 Container(
-                                  margin: const EdgeInsets.only(right: 6),
                                   padding: const EdgeInsets.symmetric(
-                                    horizontal: 6,
-                                    vertical: 2,
+                                    horizontal: 12,
+                                    vertical: 6,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: _accent,
-                                    borderRadius: BorderRadius.circular(6),
+                                    color: Colors.black54,
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: Border.all(
+                                      color: const Color(0xFF38BDF8),
+                                    ),
                                   ),
-                                  child: const Text(
-                                    'OFFLINE',
-                                    style: TextStyle(
+                                  child: Text(
+                                    _formatDuration(_remaining),
+                                    style: const TextStyle(
                                       color: Colors.white,
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w800,
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                      fontFeatures: [
+                                        FontFeature.tabularFigures()
+                                      ],
                                     ),
                                   ),
                                 ),
-                              Flexible(
-                                child: Text(
-                                  '$_platformLabel • Selesai jam $endText',
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    color: Color(0xFFBAE6FD),
-                                    fontSize: 14,
+                                if (snap != null) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    '${snap.isCharging ? "⚡" : ""}${snap.levelPct}% • ${snap.tempCelsius.toStringAsFixed(1)}°C',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w700,
+                                      color: _batteryAlertText != null
+                                          ? const Color(0xFFFBBF24)
+                                          : const Color(0xFF94A3B8),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ],
+                        ),
+                        if (_batteryAlertText != null) ...[
+                          const SizedBox(height: 8),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 6,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF78350F),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: const Color(0xFFF59E0B),
+                              ),
+                            ),
+                            child: Text(
+                              _batteryAlertText!,
+                              style: const TextStyle(
+                                color: Color(0xFFFEF3C7),
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  if (_hasInterval)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                      color:
+                          _isPausedPhase ? const Color(0xFFB45309) : _accent,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Row(
+                            children: [
+                              if (_isPausedPhase)
+                                const Icon(
+                                  Icons.cloud_rounded,
+                                  color: Colors.white,
+                                  size: 20,
+                                )
+                              else
+                                const AnimatedSoundWaveIcon(
+                                  color: Colors.white,
+                                  size: 18,
+                                ),
+                              const SizedBox(width: 10),
+                              Text(
+                                _isPausedPhase
+                                    ? 'SEDANG JEDA (ISTIRAHAT)'
+                                    : 'MEMUTAR • Jeda dlm ${_formatMinutesSeconds(_phaseRemainingSeconds)}',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold,
+                                  fontFeatures: [FontFeature.tabularFigures()],
+                                ),
+                              ),
+                            ],
+                          ),
+                          Text(
+                            '$_playMinutes m / $_pauseMinutes m',
+                            style: TextStyle(
+                              color: Colors.white.withAlpha(220),
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  Expanded(
+                    child: Stack(
+                      children: [
+                        if (!_hasError &&
+                            _isOfflinePlayback &&
+                            _videoController != null &&
+                            _videoController!.value.isInitialized)
+                          _isAudioOnlyCurrent
+                              ? _buildAudioVisualizerCard()
+                              : Center(
+                                  child: AspectRatio(
+                                    aspectRatio:
+                                        _videoController!.value.aspectRatio,
+                                    child: VideoPlayer(_videoController!),
+                                  ),
+                                )
+                        else if (!_hasError &&
+                            _webViewController != null &&
+                            _embedUrl.isNotEmpty)
+                          WebViewWidget(controller: _webViewController!),
+                        if (_isPausedPhase)
+                          Stack(
+                            children: [
+                              Container(
+                                width: double.infinity,
+                                height: double.infinity,
+                                decoration: const BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                    colors: [
+                                      Color(0xFF070D19),
+                                      Color(0xFF0F1E36),
+                                      Color(0xFF080E1A),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              const Positioned.fill(
+                                child: AnimatedCloudRestBackdrop(),
+                              ),
+                              Center(
+                                child: Padding(
+                                  padding: const EdgeInsets.all(24),
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Container(
+                                        width: 96,
+                                        height: 96,
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFF38BDF8)
+                                              .withAlpha(32),
+                                          shape: BoxShape.circle,
+                                          border: Border.all(
+                                            color: const Color(0xFF38BDF8)
+                                                .withAlpha(110),
+                                          ),
+                                        ),
+                                        child: const Icon(
+                                          Icons.cloud_queue_rounded,
+                                          size: 52,
+                                          color: Color(0xFF7DD3FC),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 18),
+                                      const Text(
+                                        'Waktu Jeda Istirahat Burung',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 24,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 8),
+                                      const Text(
+                                        'Suara dimatikan sementara agar burung tidak stres.\nLanjut otomatis dalam:',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                          color: Color(0xFFBAE6FD),
+                                          fontSize: 15,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 20),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 28,
+                                          vertical: 14,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Colors.black45,
+                                          borderRadius:
+                                              BorderRadius.circular(18),
+                                          border: Border.all(
+                                            color: const Color(0xFF38BDF8),
+                                          ),
+                                        ),
+                                        child: Text(
+                                          _formatMinutesSeconds(
+                                            _phaseRemainingSeconds,
+                                          ),
+                                          style: const TextStyle(
+                                            color: Color(0xFF7DD3FC),
+                                            fontSize: 44,
+                                            fontWeight: FontWeight.bold,
+                                            fontFeatures: [
+                                              FontFeature.tabularFigures()
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 24),
+                                      FilledButton.icon(
+                                        style: FilledButton.styleFrom(
+                                          backgroundColor: _accent,
+                                          foregroundColor: Colors.white,
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 24,
+                                            vertical: 14,
+                                          ),
+                                        ),
+                                        onPressed: _enterPlayPhase,
+                                        icon: const Icon(
+                                          Icons.play_arrow_rounded,
+                                        ),
+                                        label: const Text(
+                                          'Lanjut Putar Sekarang',
+                                          style: TextStyle(
+                                            fontSize: 16,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ),
                             ],
                           ),
-                        ],
-                      ),
-                    ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black54,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: const Color(0xFF38BDF8)),
-                      ),
-                      child: Text(
-                        _formatDuration(_remaining),
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                          fontFeatures: [FontFeature.tabularFigures()],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              if (_hasInterval)
-                Container(
-                  width: double.infinity,
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  color: _isPausedPhase ? const Color(0xFFB45309) : _accent,
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Row(
-                        children: [
-                          if (_isPausedPhase)
-                            const Icon(
-                              Icons.cloud_rounded,
-                              color: Colors.white,
-                              size: 20,
-                            )
-                          else
-                            const AnimatedSoundWaveIcon(
-                              color: Colors.white,
-                              size: 18,
-                            ),
-                          const SizedBox(width: 10),
-                          Text(
-                            _isPausedPhase
-                                ? 'SEDANG JEDA (ISTIRAHAT)'
-                                : 'MEMUTAR • Jeda dalam ${_formatMinutesSeconds(_phaseRemainingSeconds)}',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 14,
-                              fontWeight: FontWeight.bold,
-                              fontFeatures: [FontFeature.tabularFigures()],
+                        if (_isLoading && !_hasError && !_isPausedPhase)
+                          const Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                CircularProgressIndicator(color: Colors.white),
+                                SizedBox(height: 16),
+                                Text(
+                                  'Memuat audio/video masteran...',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                        ],
-                      ),
-                      Text(
-                        '$_playMinutes mnt / $_pauseMinutes mnt',
-                        style: TextStyle(
-                          color: Colors.white.withAlpha(220),
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              Expanded(
-                child: Stack(
-                  children: [
-                    if (!_hasError &&
-                        _isOfflinePlayback &&
-                        _videoController != null &&
-                        _videoController!.value.isInitialized)
-                      Center(
-                        child: AspectRatio(
-                          aspectRatio: _videoController!.value.aspectRatio,
-                          child: VideoPlayer(_videoController!),
-                        ),
-                      )
-                    else if (!_hasError &&
-                        _webViewController != null &&
-                        _embedUrl.isNotEmpty)
-                      WebViewWidget(controller: _webViewController!),
-                    if (_isPausedPhase)
-                      Stack(
-                        children: [
-                          Container(
-                            width: double.infinity,
-                            height: double.infinity,
-                            decoration: const BoxDecoration(
-                              gradient: LinearGradient(
-                                begin: Alignment.topCenter,
-                                end: Alignment.bottomCenter,
-                                colors: [
-                                  Color(0xFF070D19),
-                                  Color(0xFF0F1E36),
-                                  Color(0xFF080E1A),
-                                ],
-                              ),
-                            ),
-                          ),
-                          const Positioned.fill(
-                            child: AnimatedCloudRestBackdrop(),
-                          ),
+                        if (_hasError && !_isPausedPhase)
                           Center(
                             child: Padding(
                               padding: const EdgeInsets.all(24),
                               child: Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
+                                mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  Container(
-                                    width: 96,
-                                    height: 96,
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFF38BDF8)
-                                          .withAlpha(32),
-                                      shape: BoxShape.circle,
-                                      border: Border.all(
-                                        color: const Color(0xFF38BDF8)
-                                            .withAlpha(110),
-                                      ),
-                                    ),
-                                    child: const Icon(
-                                      Icons.cloud_queue_rounded,
-                                      size: 52,
-                                      color: Color(0xFF7DD3FC),
-                                    ),
+                                  const Icon(
+                                    Icons.wifi_off_rounded,
+                                    color: Colors.amber,
+                                    size: 56,
                                   ),
-                                  const SizedBox(height: 18),
-                                  const Text(
-                                    'Waktu Jeda Istirahat Burung',
+                                  const SizedBox(height: 16),
+                                  Text(
+                                    _errorMessage ?? 'Gagal memuat masteran.',
                                     textAlign: TextAlign.center,
-                                    style: TextStyle(
+                                    style: const TextStyle(
                                       color: Colors.white,
-                                      fontSize: 22,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 10),
-                                  const Text(
-                                    'Video dihentikan sementara agar burung beristirahat.\nPemutaran akan otomatis dilanjutkan dalam:',
-                                    textAlign: TextAlign.center,
-                                    style: TextStyle(
-                                      color: Colors.white70,
                                       fontSize: 16,
                                     ),
                                   ),
-                                  const SizedBox(height: 22),
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 28,
-                                      vertical: 14,
-                                    ),
-                                    decoration: BoxDecoration(
-                                      color: Colors.black45,
-                                      borderRadius: BorderRadius.circular(18),
-                                      border: Border.all(
-                                          color: const Color(0xFF38BDF8)),
-                                    ),
-                                    child: Text(
-                                      _formatMinutesSeconds(
-                                          _phaseRemainingSeconds),
-                                      style: const TextStyle(
-                                        color: Color(0xFF7DD3FC),
-                                        fontSize: 44,
-                                        fontWeight: FontWeight.bold,
-                                        fontFeatures: [
-                                          FontFeature.tabularFigures()
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 24),
+                                  const SizedBox(height: 20),
                                   FilledButton.icon(
-                                    style: FilledButton.styleFrom(
-                                      backgroundColor: _accent,
-                                      foregroundColor: Colors.white,
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 24,
-                                        vertical: 14,
-                                      ),
-                                    ),
                                     onPressed: _enterPlayPhase,
-                                    icon: const Icon(Icons.play_arrow_rounded),
-                                    label: const Text(
-                                      'Lanjut Putar Sekarang',
-                                      style: TextStyle(
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
+                                    icon: const Icon(Icons.refresh),
+                                    label: const Text('Coba Muat Ulang'),
                                   ),
                                 ],
                               ),
                             ),
                           ),
+                      ],
+                    ),
+                  ),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.fromLTRB(12, 10, 12, 14),
+                    color: Colors.grey.shade900,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (_tracks.length > 1 && !_isPausedPhase) ...[
+                          Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton.icon(
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: Colors.white,
+                                    side: const BorderSide(
+                                      color: Color(0xFF475569),
+                                    ),
+                                    minimumSize: const Size(0, 40),
+                                  ),
+                                  onPressed: () => unawaited(_playPrevTrack()),
+                                  icon: const Icon(Icons.skip_previous_rounded),
+                                  label: const Text('Sebelumnya'),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: OutlinedButton.icon(
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: Colors.white,
+                                    side: const BorderSide(
+                                      color: Color(0xFF475569),
+                                    ),
+                                    minimumSize: const Size(0, 40),
+                                  ),
+                                  onPressed: () => unawaited(_playNextTrack()),
+                                  icon: const Icon(Icons.skip_next_rounded),
+                                  label: const Text('Berikutnya'),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
                         ],
-                      ),
-                    if (_isLoading && !_hasError && !_isPausedPhase)
-                      const Center(
+                        Row(
+                          children: [
+                            SizedBox(
+                              height: 54,
+                              child: OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: const Color(0xFF7DD3FC),
+                                  side: const BorderSide(
+                                    color: Color(0xFF38BDF8),
+                                  ),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14),
+                                  ),
+                                ),
+                                onPressed: () => unawaited(
+                                  _setOledDimMode(true),
+                                ),
+                                icon: const Icon(
+                                  Icons.dark_mode_rounded,
+                                  size: 20,
+                                ),
+                                label: const Text(
+                                  'OLED',
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            if (_hasInterval && !_isPausedPhase) ...[
+                              const SizedBox(width: 8),
+                              SizedBox(
+                                height: 54,
+                                child: OutlinedButton.icon(
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: Colors.amber.shade300,
+                                    side: BorderSide(
+                                      color: Colors.amber.shade400,
+                                    ),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(14),
+                                    ),
+                                  ),
+                                  onPressed: _enterPausePhase,
+                                  icon: const Icon(
+                                    Icons.pause_rounded,
+                                    size: 22,
+                                  ),
+                                  label: const Text(
+                                    'JEDA',
+                                    style: TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: SizedBox(
+                                height: 54,
+                                child: FilledButton.icon(
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: Colors.red.shade700,
+                                    foregroundColor: Colors.white,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(14),
+                                    ),
+                                  ),
+                                  onPressed: _stopAndClose,
+                                  icon: const Icon(
+                                    Icons.stop_circle_rounded,
+                                    size: 24,
+                                  ),
+                                  label: const Text(
+                                    'STOP',
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                      letterSpacing: 0.4,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_isOledDimMode)
+              Positioned.fill(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onDoubleTap: () => unawaited(_setOledDimMode(false)),
+                  child: Container(
+                    color: Colors.black,
+                    child: Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            CircularProgressIndicator(color: Colors.white),
-                            SizedBox(height: 16),
+                            const Icon(
+                              Icons.nights_stay_rounded,
+                              color: Color(0xFF334155),
+                              size: 40,
+                            ),
+                            const SizedBox(height: 16),
                             Text(
-                              'Memuat video masteran...',
+                              _formatDuration(_remaining),
+                              style: const TextStyle(
+                                color: Color(0xFF475569),
+                                fontSize: 38,
+                                fontWeight: FontWeight.w700,
+                                fontFeatures: [FontFeature.tabularFigures()],
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              _currentTrackTitle,
+                              textAlign: TextAlign.center,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Color(0xFF334155),
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            if (_manualOledOverride || snap != null) ...[
+                              const SizedBox(height: 6),
+                              Text(
+                                snap != null
+                                    ? 'Baterai ${snap.levelPct}% • ${snap.tempCelsius.toStringAsFixed(1)}°C'
+                                    : 'Mode Layar Hitam OLED Aktif',
+                                style: const TextStyle(
+                                  color: Color(0xFF334155),
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                            const SizedBox(height: 28),
+                            const Text(
+                              'Ketuk layar 2x untuk menyalakan tampilan',
                               style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 16,
+                                color: Color(0xFF475569),
+                                fontSize: 12,
                               ),
                             ),
                           ],
                         ),
                       ),
-                    if (_hasError && !_isPausedPhase)
-                      Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(
-                                Icons.wifi_off_rounded,
-                                color: Colors.amber,
-                                size: 56,
-                              ),
-                              const SizedBox(height: 16),
-                              Text(
-                                _errorMessage ?? 'Gagal memuat video.',
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 16,
-                                ),
-                              ),
-                              const SizedBox(height: 20),
-                              FilledButton.icon(
-                                onPressed: _enterPlayPhase,
-                                icon: const Icon(Icons.refresh),
-                                label: const Text('Coba Muat Ulang'),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                  ],
+                    ),
+                  ),
                 ),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAudioVisualizerCard() {
+    return Container(
+      width: double.infinity,
+      height: double.infinity,
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            Color(0xFF060B14),
+            Color(0xFF0F172A),
+            Color(0xFF060B14),
+          ],
+        ),
+      ),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
               Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(16),
-                color: Colors.grey.shade900,
-                child: Row(
-                  children: [
-                    if (_hasInterval && !_isPausedPhase) ...[
-                      SizedBox(
-                        height: 58,
-                        child: OutlinedButton.icon(
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: Colors.amber.shade300,
-                            side: BorderSide(color: Colors.amber.shade400),
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                          ),
-                          onPressed: _enterPausePhase,
-                          icon: const Icon(Icons.pause_rounded, size: 24),
-                          label: const Text(
-                            'JEDA',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                    ],
-                    Expanded(
-                      child: SizedBox(
-                        height: 58,
-                        child: FilledButton.icon(
-                          style: FilledButton.styleFrom(
-                            backgroundColor: Colors.red.shade700,
-                            foregroundColor: Colors.white,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                          ),
-                          onPressed: _stopAndClose,
-                          icon: const Icon(Icons.stop_circle_rounded, size: 28),
-                          label: const Text(
-                            'STOP MASTERAN',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 0.5,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
+                width: 112,
+                height: 112,
+                decoration: BoxDecoration(
+                  color: _accent.withAlpha(38),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: _accent.withAlpha(140), width: 2),
+                ),
+                child: const Center(
+                  child: AnimatedSoundWaveIcon(
+                    color: Color(0xFF7DD3FC),
+                    size: 46,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 22),
+              Text(
+                _currentTrackTitle,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Audio Masteran Lokal HP (100% Offline • Fade-In $_startVolume% → $_targetVolume%)',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFF94A3B8),
+                  fontSize: 13,
                 ),
               ),
             ],

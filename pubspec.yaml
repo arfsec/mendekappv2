@@ -1,7 +1,7 @@
 name: mendek_arena_masteran
-description: Aplikasi Android penjadwal putar video masteran burung otomatis dari YouTube dan TikTok.
+description: Aplikasi Android masteran burung otomatis v3.3 dengan Auto-Sync Server & GitHub tanpa install ulang, 1-Tap In-App Updater, Media Sosial Komunitas, prakiraan cuaca BMKG besok, playlist multi-suara, dan Battery Guard.
 publish_to: 'none'
-version: 2.0.0+3
+version: 3.3.0+7
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
