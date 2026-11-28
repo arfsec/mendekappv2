@@ -58,6 +58,16 @@ class NotifService {
       'Info otomatis jam hujan dan jam panas besok dari BMKG sesuai wilayah HP';
   static const int _bmkgInstantNotifId = 991001;
   static const int _bmkgDailyNotifId = 991002;
+  static const String _licenseChannelId = 'mendek_license_status_v1';
+  static const String _licenseChannelName = 'Status Lisensi Sewa';
+  static const String _licenseChannelDesc =
+      'Pemberitahuan otomatis ketika masa aktif license habis';
+  static const int _licenseExpiredNotifId = 991999;
+  static const String _careChannelId = 'mendek_care_ef_reminder_v1';
+  static const String _careChannelName = 'Pengingat EF & Rawat Burung';
+  static const String _careChannelDesc =
+      'Pengingat jam makan EF, embun, mandi, jemur, dan vitamin burung';
+  static const int _careTimerNotifId = 992999;
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -131,6 +141,24 @@ class NotifService {
         enableVibration: true,
       );
       await androidPlugin.createNotificationChannel(bmkgChannel);
+      const AndroidNotificationChannel licChannel = AndroidNotificationChannel(
+        _licenseChannelId,
+        _licenseChannelName,
+        description: _licenseChannelDesc,
+        importance: Importance.max,
+        playSound: true,
+        enableVibration: true,
+      );
+      await androidPlugin.createNotificationChannel(licChannel);
+      const AndroidNotificationChannel careChannel = AndroidNotificationChannel(
+        _careChannelId,
+        _careChannelName,
+        description: _careChannelDesc,
+        importance: Importance.high,
+        playSound: true,
+        enableVibration: true,
+      );
+      await androidPlugin.createNotificationChannel(careChannel);
     }
 
     _initialized = true;
@@ -604,5 +632,114 @@ class NotifService {
 
   void dispose() {
     _payloadController.close();
+  }
+
+  Future<void> showLicenseExpiredNotification([
+    String message = 'License expired, silakan meminta yang baru.',
+  ]) async {
+    await init();
+    const AndroidNotificationDetails androidDetails =
+        AndroidNotificationDetails(
+      _licenseChannelId,
+      _licenseChannelName,
+      channelDescription: _licenseChannelDesc,
+      importance: Importance.max,
+      priority: Priority.max,
+      category: AndroidNotificationCategory.status,
+      visibility: NotificationVisibility.public,
+      playSound: true,
+      enableVibration: true,
+    );
+    await _plugin.show(
+      _licenseExpiredNotifId,
+      'License Expired — Mendek Arena',
+      message,
+      const NotificationDetails(android: androidDetails),
+      payload: 'license_expired',
+    );
+  }
+
+  Future<void> showCareTimerFinishedNotification(String title) async {
+    await init();
+    const AndroidNotificationDetails androidDetails =
+        AndroidNotificationDetails(
+      _careChannelId,
+      _careChannelName,
+      channelDescription: _careChannelDesc,
+      importance: Importance.max,
+      priority: Priority.high,
+      playSound: true,
+      enableVibration: true,
+    );
+    await _plugin.show(
+      _careTimerNotifId,
+      'Timer Rawatan Selesai',
+      'Waktu "$title" sudah selesai. Segera teduhkan / lanjutkan rawatan.',
+      const NotificationDetails(android: androidDetails),
+      payload: 'care_timer_done',
+    );
+  }
+
+  Future<void> syncCareDailyReminders(
+    List<Map<String, dynamic>> careItems,
+  ) async {
+    await init();
+    for (int id = 992000; id < 992100; id++) {
+      await _plugin.cancel(id);
+    }
+    int slot = 0;
+    for (final item in careItems) {
+      if (slot >= 100) break;
+      if (item['notify'] == false) continue;
+      final rawTime = (item['time']?.toString() ?? '').trim();
+      final parts = rawTime.split(':');
+      if (parts.length != 2) continue;
+      final hour = int.tryParse(parts[0]);
+      final minute = int.tryParse(parts[1]);
+      if (hour == null || minute == null || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        continue;
+      }
+      final title = (item['title']?.toString() ?? 'Rawatan Burung').trim();
+      final detail = (item['detail']?.toString() ?? '').trim();
+      final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
+      tz.TZDateTime scheduled = tz.TZDateTime(
+        tz.local,
+        now.year,
+        now.month,
+        now.day,
+        hour,
+        minute,
+      );
+      if (!scheduled.isAfter(now)) {
+        scheduled = scheduled.add(const Duration(days: 1));
+      }
+      const AndroidNotificationDetails androidDetails =
+          AndroidNotificationDetails(
+        _careChannelId,
+        _careChannelName,
+        channelDescription: _careChannelDesc,
+        importance: Importance.high,
+        priority: Priority.high,
+        playSound: true,
+        enableVibration: true,
+      );
+      try {
+        await _plugin.zonedSchedule(
+          992000 + slot,
+          'Pengingat Rawatan: $title',
+          detail.isNotEmpty ? detail : 'Waktunya settingan / EF burung ($rawTime).',
+          scheduled,
+          const NotificationDetails(android: androidDetails),
+          androidScheduleMode: AndroidScheduleMode.alarmClock,
+          uiLocalNotificationDateInterpretation:
+              UILocalNotificationDateInterpretation.absoluteTime,
+          matchDateTimeComponents: DateTimeComponents.time,
+          payload: 'care_reminder',
+        );
+      } catch (e) {
+        debugPrint('Care reminder schedule error: $e');
+      }
+      slot++;
+    }
   }
 }

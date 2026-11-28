@@ -6,8 +6,8 @@ import 'home_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   final String? pendingPayload;
-
-  const LoginScreen({super.key, this.pendingPayload});
+  final String? initialError;
+  const LoginScreen({super.key, this.pendingPayload, this.initialError});
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -19,6 +19,12 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _isSubmitting = false;
   bool _isRefreshingConfig = false;
   String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _errorMessage = widget.initialError;
+  }
 
   RemoteConfig get _cfg => ApiService.instance.remoteConfig;
   Color get _accent => _cfg.accentColor;

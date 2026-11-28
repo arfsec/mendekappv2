@@ -21,6 +21,7 @@ import '../widgets/premium_visuals.dart';
 import 'add_edit_screen.dart';
 import 'live_module_webview_screen.dart';
 import 'login_screen.dart';
+import 'music_box_sheet.dart';
 import 'player_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -40,6 +41,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const String _prefBirdProfiles = 'mendek_bird_profiles_v3';
   static const String _prefActiveBirdId = 'mendek_active_bird_id_v3';
   static const String _prefCareByBird = 'mendek_care_by_bird_v3';
+  static const String _prefSettingLogsByBird = 'mendek_setting_logs_v3';
 
   List<BirdProfile> _birdProfiles = const [
     BirdProfile(
@@ -51,6 +53,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   ];
   String _activeBirdId = 'bird_default';
   Map<String, List<Map<String, dynamic>>> _careItemsByBird = {};
+  Map<String, List<Map<String, dynamic>>> _settingLogsByBird = {};
+  List<Map<String, dynamic>> _settingLogs = [];
+  bool _handlingExpiredExit = false;
+  Timer? _careTimer;
+  String? _activeCareTimerTitle;
+  int _careTimerRemainingSec = 0;
+  bool _careTimerRunning = false;
   String _installedAppVersion = ApiService.appVersion;
   BmkgTomorrowSummary? _bmkgSummary;
   bool _bmkgLoading = false;
@@ -112,6 +121,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       const Duration(seconds: 2),
       (_) {
         if (!mounted) return;
+        if (ApiService.instance.isSessionExpired) {
+          unawaited(
+            _handleLicenseExpiredLogout(
+              'License expired, silakan meminta yang baru.',
+            ),
+          );
+          return;
+        }
         setState(() {
           _clockNow = DateTime.now();
         });
@@ -124,6 +141,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      if (ApiService.instance.isSessionExpired) {
+        unawaited(
+          _handleLicenseExpiredLogout(
+            'License expired, silakan meminta yang baru.',
+          ),
+        );
+        return;
+      }
       _refreshPermissionStatusOnly();
       unawaited(_checkPendingNativeAlarmPayload());
       _checkActiveScheduleNow();
@@ -179,6 +204,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       await DbService.instance.getAllSchedules(),
     );
     await NotifService.instance.rescheduleAll(schedules);
+    await _syncCareNotifications();
     await BmkgWeatherService.instance.ensureReminderScheduled();
     final activeForStandby = schedules.where((s) => s.isActive).toList();
     if (activeForStandby.isNotEmpty) {
@@ -241,8 +267,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
     if (!mounted) return stillValid;
     if (!stillValid) {
-      Navigator.of(context).pushReplacement(
-        buildPremiumRoute(LoginScreen(pendingPayload: widget.initialPayload)),
+      await _handleLicenseExpiredLogout(
+        ApiService.instance.lastAuthError ??
+            'License expired, silakan meminta yang baru.',
       );
       return false;
     }
@@ -253,15 +280,105 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return true;
   }
 
+  static const Map<String, String> _careCategoryLabels = {
+    'pakan': 'Pakan / EF',
+    'embun': 'Embun Pagi',
+    'mandi': 'Mandi Keramba',
+    'jemur': 'Penjemuran',
+    'vitamin': 'Vitamin / Obat',
+    'lainnya': 'Lainnya',
+  };
+
   List<Map<String, dynamic>> _defaultCareItems() {
     return [
-      {'title': 'Embun Pagi (05:30)', 'detail': 'Gantang teras 30 menit', 'done': false},
-      {'title': 'Pakan EF Pagi (07:00)', 'detail': '5 jangkrik + air bersih', 'done': false},
-      {'title': 'Mandi Keramba (08:00)', 'detail': 'Mandi pagi secukupnya', 'done': false},
-      {'title': 'Jemur Pagi (08:30)', 'detail': 'Jemur 35 menit lalu teduh', 'done': false},
-      {'title': 'EF Sore (16:30)', 'detail': '4 jangkrik + kroto', 'done': false},
-      {'title': 'Kerodong Malam (18:30)', 'detail': 'Siap masteran malam', 'done': false},
+      {
+        'id': 'care_embun',
+        'category': 'embun',
+        'time': '05:30',
+        'title': 'Embun Pagi',
+        'detail': 'Gantang teras 30 menit',
+        'durationMin': 30,
+        'notify': true,
+        'done': false,
+      },
+      {
+        'id': 'care_ef_pagi',
+        'category': 'pakan',
+        'time': '07:00',
+        'title': 'Pakan EF Pagi',
+        'detail': '5 jangkrik + air bersih',
+        'durationMin': 0,
+        'notify': true,
+        'done': false,
+      },
+      {
+        'id': 'care_mandi',
+        'category': 'mandi',
+        'time': '08:00',
+        'title': 'Mandi Keramba',
+        'detail': 'Mandi pagi secukupnya',
+        'durationMin': 15,
+        'notify': true,
+        'done': false,
+      },
+      {
+        'id': 'care_jemur',
+        'category': 'jemur',
+        'time': '08:30',
+        'title': 'Jemur Pagi',
+        'detail': 'Jemur 35 menit lalu teduh',
+        'durationMin': 35,
+        'notify': true,
+        'done': false,
+      },
+      {
+        'id': 'care_ef_sore',
+        'category': 'pakan',
+        'time': '16:30',
+        'title': 'EF Sore',
+        'detail': '4 jangkrik + kroto',
+        'durationMin': 0,
+        'notify': true,
+        'done': false,
+      },
+      {
+        'id': 'care_kerodong',
+        'category': 'lainnya',
+        'time': '18:30',
+        'title': 'Kerodong Malam',
+        'detail': 'Siap masteran malam',
+        'durationMin': 0,
+        'notify': true,
+        'done': false,
+      },
     ];
+  }
+
+  List<Map<String, dynamic>> _normalizeCareList(List<Map<String, dynamic>> raw) {
+    final normalized = raw.asMap().entries.map((entry) {
+      final i = entry.key;
+      final m = Map<String, dynamic>.from(entry.value);
+      m['id'] ??= 'care_migrated_${DateTime.now().millisecondsSinceEpoch}_$i';
+      m['category'] ??= 'pakan';
+      m['time'] ??= '07:00';
+      m['durationMin'] = (m['durationMin'] as num?)?.toInt() ?? 0;
+      m['notify'] ??= true;
+      m['done'] ??= false;
+      return m;
+    }).toList();
+    normalized.sort(
+      (a, b) => (a['time']?.toString() ?? '00:00')
+          .compareTo(b['time']?.toString() ?? '00:00'),
+    );
+    return normalized;
+  }
+
+  Future<void> _syncCareNotifications() async {
+    final allItems = <Map<String, dynamic>>[];
+    for (final list in _careItemsByBird.values) {
+      allItems.addAll(list);
+    }
+    await NotifService.instance.syncCareDailyReminders(allItems);
   }
 
   Future<void> _loadCareState() async {
@@ -326,8 +443,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     for (final b in loadedProfiles) {
       careMap.putIfAbsent(b.id, _defaultCareItems);
+      careMap[b.id] = _normalizeCareList(careMap[b.id]!);
     }
-
+    final Map<String, List<Map<String, dynamic>>> logsMap = {};
+    final rawLogs = prefs.getString(_prefSettingLogsByBird);
+    if (rawLogs != null && rawLogs.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawLogs) as Map<String, dynamic>;
+        decoded.forEach((key, val) {
+          if (val is List) {
+            logsMap[key] = val
+                .whereType<Map>()
+                .map((m) => Map<String, dynamic>.from(m))
+                .toList();
+          }
+        });
+      } catch (_) {}
+    }
     if (!mounted) return;
     setState(() {
       _birdProfiles = loadedProfiles;
@@ -336,17 +468,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ? savedActiveId
           : loadedProfiles.first.id;
       _careItemsByBird = careMap;
+      _settingLogsByBird = logsMap;
       final current = _activeBird;
       _birdName = current.name;
       _birdMode = current.mode;
       _careItems = careMap[current.id] ?? _defaultCareItems();
+      _settingLogs = logsMap[current.id] ?? [];
     });
   }
 
   Future<void> _saveCareState() async {
     final prefs = await SharedPreferences.getInstance();
     final currentId = _activeBird.id;
+    _careItems = _normalizeCareList(_careItems);
     _careItemsByBird[currentId] = _careItems;
+    _settingLogsByBird[currentId] = _settingLogs;
     _birdProfiles = _birdProfiles
         .map(
           (b) => b.id == currentId
@@ -361,9 +497,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
     await prefs.setString(_prefActiveBirdId, _activeBirdId);
     await prefs.setString(_prefCareByBird, jsonEncode(_careItemsByBird));
+    await prefs.setString(_prefSettingLogsByBird, jsonEncode(_settingLogsByBird));
     await prefs.setString(_prefBirdName, _birdName);
     await prefs.setString(_prefBirdMode, _birdMode);
     await prefs.setString(_prefCareItems, jsonEncode(_careItems));
+    unawaited(_syncCareNotifications());
   }
 
   Future<void> _selectBirdProfile(String id) async {
@@ -372,7 +510,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final current = _activeBird;
       _birdName = current.name;
       _birdMode = current.mode;
-      _careItems = _careItemsByBird[current.id] ?? _defaultCareItems();
+      _careItems = _normalizeCareList(
+        _careItemsByBird[current.id] ?? _defaultCareItems(),
+      );
+      _settingLogs = _settingLogsByBird[current.id] ?? [];
     });
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefActiveBirdId, _activeBirdId);
@@ -459,7 +600,405 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _saveCareState();
   }
 
+  Future<void> _handleLicenseExpiredLogout([String? customMsg]) async {
+    if (_handlingExpiredExit) return;
+    _handlingExpiredExit = true;
+    final msg = (customMsg != null && customMsg.trim().isNotEmpty)
+        ? customMsg.trim()
+        : 'License expired, silakan meminta yang baru.';
+    _clockWatcherTimer?.cancel();
+    _autoSyncTimer?.cancel();
+    _careTimer?.cancel();
+    _careTimer?.cancel();
+    unawaited(NotifService.instance.stopStandbyService());
+    await NotifService.instance.showLicenseExpiredNotification(msg);
+    await ApiService.instance.logout();
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      buildPremiumRoute(
+        LoginScreen(
+          pendingPayload: widget.initialPayload,
+          initialError: msg,
+        ),
+      ),
+      (_) => false,
+    );
+  }
+
+  void _startCareCountdown(String title, int minutes) {
+    _careTimer?.cancel();
+    setState(() {
+      _activeCareTimerTitle = title;
+      _careTimerRemainingSec = minutes.clamp(1, 240) * 60;
+      _careTimerRunning = true;
+    });
+    _careTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      if (!_careTimerRunning) return;
+      if (_careTimerRemainingSec <= 1) {
+        _careTimer?.cancel();
+        final finishedTitle = _activeCareTimerTitle ?? title;
+        setState(() {
+          _careTimerRemainingSec = 0;
+          _careTimerRunning = false;
+        });
+        unawaited(SystemSound.play(SystemSoundType.alert));
+        unawaited(
+          NotifService.instance.showCareTimerFinishedNotification(finishedTitle),
+        );
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Timer "$finishedTitle" selesai!'),
+          ),
+        );
+      } else {
+        setState(() {
+          _careTimerRemainingSec -= 1;
+        });
+      }
+    });
+  }
+
+  void _stopCareCountdown() {
+    _careTimer?.cancel();
+    setState(() {
+      _activeCareTimerTitle = null;
+      _careTimerRemainingSec = 0;
+      _careTimerRunning = false;
+    });
+  }
+
+  Future<void> _deleteCareItem(int index) async {
+    if (index < 0 || index >= _careItems.length) return;
+    final removedTitle = _careItems[index]['title']?.toString() ?? 'Jadwal';
+    setState(() {
+      _careItems.removeAt(index);
+    });
+    await _saveCareState();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Jadwal "$removedTitle" dihapus.')),
+    );
+  }
+
+  Future<void> _showCareItemEditorSheet({int? editIndex}) async {
+    final existing = (editIndex != null && editIndex >= 0 && editIndex < _careItems.length)
+        ? _careItems[editIndex]
+        : null;
+    String selectedCategory =
+        existing?['category']?.toString() ?? 'pakan';
+    if (!_careCategoryLabels.containsKey(selectedCategory)) {
+      selectedCategory = 'lainnya';
+    }
+    final rawTime = (existing?['time']?.toString() ?? '07:00').split(':');
+    TimeOfDay selectedTime = TimeOfDay(
+      hour: int.tryParse(rawTime.isNotEmpty ? rawTime[0] : '7') ?? 7,
+      minute: int.tryParse(rawTime.length > 1 ? rawTime[1] : '0') ?? 0,
+    );
+    final titleCtrl = TextEditingController(
+      text: existing?['title']?.toString() ?? '',
+    );
+    final detailCtrl = TextEditingController(
+      text: existing?['detail']?.toString() ?? '',
+    );
+    final durationCtrl = TextEditingController(
+      text: ((existing?['durationMin'] as num?)?.toInt() ?? 0) > 0
+          ? '${(existing?['durationMin'] as num).toInt()}'
+          : '',
+    );
+    bool notifyEnabled = existing?['notify'] != false;
+
+    final saved = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) {
+          final timeStr =
+              '${selectedTime.hour.toString().padLeft(2, '0')}:${selectedTime.minute.toString().padLeft(2, '0')}';
+          return Padding(
+            padding: EdgeInsets.only(
+              bottom: MediaQuery.of(ctx).viewInsets.bottom,
+            ),
+            child: Container(
+              decoration: const BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+              ),
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 24),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 40,
+                        height: 4,
+                        margin: const EdgeInsets.only(bottom: 14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFD1D5DB),
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    Text(
+                      existing != null
+                          ? 'Edit Jadwal Settingan / EF'
+                          : 'Buat Jadwal Settingan EF & Rawatan',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                        color: Color(0xFF1C1C1E),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Kategori',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF6E6E73),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      children: _careCategoryLabels.entries.map((entry) {
+                        final isSel = selectedCategory == entry.key;
+                        return ChoiceChip(
+                          label: Text(entry.value),
+                          selected: isSel,
+                          selectedColor: _appleBlue,
+                          labelStyle: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: isSel ? Colors.white : const Color(0xFF1C1C1E),
+                          ),
+                          onSelected: (_) => setSheetState(
+                            () => selectedCategory = entry.key,
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: () async {
+                              final picked = await showTimePicker(
+                                context: ctx,
+                                initialTime: selectedTime,
+                              );
+                              if (picked != null && ctx.mounted) {
+                                setSheetState(() => selectedTime = picked);
+                              }
+                            },
+                            icon: const Icon(Icons.schedule_rounded, size: 18),
+                            label: Text('Jam: $timeStr'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: TextField(
+                            controller: durationCtrl,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'Timer (menit, opsional)',
+                              isDense: true,
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: titleCtrl,
+                      decoration: const InputDecoration(
+                        labelText: 'Nama Settingan / EF (cth: Jangkrik Pagi)',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: detailCtrl,
+                      maxLines: 2,
+                      decoration: const InputDecoration(
+                        labelText: 'Takaran / Catatan (cth: 7 ekor + kroto 1 sdt)',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      value: notifyEnabled,
+                      activeColor: _appleBlue,
+                      title: const Text(
+                        'Aktifkan Pengingat Notifikasi Harian',
+                        style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700),
+                      ),
+                      onChanged: (v) => setSheetState(() => notifyEnabled = v),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () => Navigator.pop(ctx, false),
+                            child: const Text('Batal'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: FilledButton(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: _appleBlue,
+                            ),
+                            onPressed: () => Navigator.pop(ctx, true),
+                            child: Text(existing != null ? 'Simpan' : 'Tambah'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+    if (saved != true || !mounted) return;
+    final title = titleCtrl.text.trim();
+    if (title.isEmpty) return;
+    final timeStr =
+        '${selectedTime.hour.toString().padLeft(2, '0')}:${selectedTime.minute.toString().padLeft(2, '0')}';
+    final durMin = int.tryParse(durationCtrl.text.trim()) ?? 0;
+    final entry = <String, dynamic>{
+      'id': existing?['id'] ?? 'care_${DateTime.now().millisecondsSinceEpoch}',
+      'category': selectedCategory,
+      'time': timeStr,
+      'title': title,
+      'detail': detailCtrl.text.trim().isEmpty
+          ? 'Sesuai takaran harian'
+          : detailCtrl.text.trim(),
+      'durationMin': durMin > 0 ? durMin : 0,
+      'notify': notifyEnabled,
+      'done': existing?['done'] == true,
+    };
+    setState(() {
+      if (editIndex != null && editIndex >= 0 && editIndex < _careItems.length) {
+        _careItems[editIndex] = entry;
+      } else {
+        _careItems.add(entry);
+      }
+    });
+    await _saveCareState();
+  }
+
+  Future<void> _showAddSettingLogDialog() async {
+    final eventCtrl = TextEditingController();
+    final efCtrl = TextEditingController();
+    final jemurCtrl = TextEditingController(text: '25');
+    final notesCtrl = TextEditingController();
+    String outcome = 'Koncer / Juara';
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlgState) => AlertDialog(
+          title: const Text('Catat Hasil Settingan / Lomba'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: eventCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Nama Agenda (cth: Latber Minggu / Harian)',
+                  ),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: efCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Takaran EF (cth: 6 jangkrik + kroto)',
+                  ),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: jemurCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Durasi Jemur (menit)',
+                  ),
+                ),
+                const SizedBox(height: 10),
+                DropdownButtonFormField<String>(
+                  value: outcome,
+                  decoration: const InputDecoration(
+                    labelText: 'Hasil di Lapangan / Rumah',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: const [
+                    DropdownMenuItem(value: 'Koncer / Juara', child: Text('Koncer / Juara')),
+                    DropdownMenuItem(value: 'Kerja Stabil', child: Text('Kerja Stabil')),
+                    DropdownMenuItem(value: 'Kurang Ngotot', child: Text('Kurang Ngotot')),
+                    DropdownMenuItem(value: 'Over Birahi', child: Text('Over Birahi')),
+                  ],
+                  onChanged: (v) {
+                    if (v != null) setDlgState(() => outcome = v);
+                  },
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: notesCtrl,
+                  maxLines: 2,
+                  decoration: const InputDecoration(
+                    labelText: 'Catatan Evaluasi (opsional)',
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Batal'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Simpan Log'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final ev = eventCtrl.text.trim();
+    if (ev.isEmpty) return;
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+    setState(() {
+      _settingLogs.insert(0, {
+        'id': 'log_${DateTime.now().millisecondsSinceEpoch}',
+        'date': today,
+        'event': ev,
+        'ef': efCtrl.text.trim().isEmpty ? 'EF Harian standar' : efCtrl.text.trim(),
+        'jemurMin': int.tryParse(jemurCtrl.text.trim()) ?? 0,
+        'outcome': outcome,
+        'notes': notesCtrl.text.trim(),
+      });
+    });
+    await _saveCareState();
+  }
+
   Future<void> _showEditBirdAndCareDialog({bool isNewCare = false}) async {
+    if (isNewCare) {
+      await _showCareItemEditorSheet();
+      return;
+    }
     final titleCtrl = TextEditingController(text: isNewCare ? '' : _birdName);
     final detailCtrl = TextEditingController();
     final ok = await showDialog<bool>(
@@ -1675,6 +2214,79 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return 'Berikutnya: ${closestSchedule.name} (${closestSchedule.formattedStartTime}) · $countdown lagi';
   }
 
+  Widget _buildLicenseExpiryBanner(int? expiringDays) {
+    final expLabel = ApiService.instance.expiryDisplayLabel;
+    final remDays = ApiService.instance.remainingDaysLeft;
+    final isLifetime = ApiService.instance.expiresAtDate == null;
+    final isSoon = expiringDays != null && expiringDays <= 3;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+      decoration: BoxDecoration(
+        color: isSoon ? const Color(0xFFFFFBEB) : Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: isSoon
+              ? const Color(0xFFFCD34D)
+              : const Color(0xFFE5E5EA),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isLifetime
+                ? Icons.verified_user_rounded
+                : Icons.event_available_rounded,
+            size: 19,
+            color: isSoon ? const Color(0xFFB45309) : _appleBlue,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  isLifetime
+                      ? 'Masa Aktif Lisensi: Selamanya (Lifetime)'
+                      : 'Expired Lisensi: $expLabel',
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w800,
+                    color: isSoon
+                        ? const Color(0xFF92400E)
+                        : const Color(0xFF1C1C1E),
+                  ),
+                ),
+                Text(
+                  isLifetime
+                      ? 'Key ${ApiService.instance.session?.key ?? '-'} aktif permanen'
+                      : 'Sisa waktu: ${remDays ?? 0} hari • Key ${ApiService.instance.session?.key ?? '-'}',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xFF6E6E73),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (!isLifetime)
+            TextButton(
+              onPressed: _launchWhatsAppRenew,
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              child: const Text(
+                'Perpanjang',
+                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildEngineDiagnosticCard(List<Schedule> activeSchedules) {
     final bool bridgeReady = _nativeBridgeActive != false;
     final String nextText = _nextAlarmCountdownLabel(activeSchedules);
@@ -2395,6 +3007,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ],
             ),
           ),
+        _buildLicenseExpiryBanner(expiringDays),
         if (expiringDays != null)
           Container(
             margin: const EdgeInsets.only(bottom: 14),
@@ -3404,29 +4017,318 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 ],
               ),
               const SizedBox(height: 6),
+              if (_activeCareTimerTitle != null) ...[
+                Container(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFEFF6FF),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0xFF93C5FD)),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.timer_rounded, color: _appleBlue),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              _activeCareTimerTitle!,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            Text(
+                              '${(_careTimerRemainingSec ~/ 60).toString().padLeft(2, '0')}:${(_careTimerRemainingSec % 60).toString().padLeft(2, '0')}',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w900,
+                                color: _appleBlue,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: () {
+                          setState(() => _careTimerRunning = !_careTimerRunning);
+                        },
+                        icon: Icon(
+                          _careTimerRunning
+                              ? Icons.pause_circle_rounded
+                              : Icons.play_circle_rounded,
+                          color: _appleBlue,
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: _stopCareCountdown,
+                        icon: const Icon(
+                          Icons.stop_circle_rounded,
+                          color: Color(0xFFEF4444),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+              if (_careItems.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12),
+                  child: Text(
+                    'Belum ada jadwal EF / rawatan. Tekan "+ Tambah" untuk membuat jadwal mandiri.',
+                    style: TextStyle(fontSize: 12.5, color: Color(0xFF6E6E73)),
+                  ),
+                ),
               ...List.generate(_careItems.length, (i) {
                 final item = _careItems[i];
                 final done = item['done'] == true;
-                return CheckboxListTile(
-                  contentPadding: EdgeInsets.zero,
-                  value: done,
-                  activeColor: _appleBlue,
-                  onChanged: (_) => _toggleCareDone(i),
-                  title: Text(
-                    item['title']?.toString() ?? '',
-                    style: TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w700,
-                      decoration: done ? TextDecoration.lineThrough : null,
-                      color: done ? const Color(0xFF8E8E93) : const Color(0xFF1C1C1E),
-                    ),
+                final catKey = item['category']?.toString() ?? 'pakan';
+                final catLabel = _careCategoryLabels[catKey] ?? 'Rawatan';
+                final timeStr = item['time']?.toString() ?? '';
+                final durMin = (item['durationMin'] as num?)?.toInt() ?? 0;
+                final notifyOn = item['notify'] != false;
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF8FAFC),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0xFFE2E8F0)),
                   ),
-                  subtitle: Text(
-                    item['detail']?.toString() ?? '',
-                    style: const TextStyle(fontSize: 12, color: Color(0xFF6E6E73)),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Checkbox(
+                        value: done,
+                        activeColor: _appleBlue,
+                        onChanged: (_) => _toggleCareDone(i),
+                      ),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Wrap(
+                              spacing: 6,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                if (timeStr.isNotEmpty)
+                                  Text(
+                                    timeStr,
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w800,
+                                      color: _appleBlue,
+                                    ),
+                                  ),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFFE2E8F0),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(
+                                    catLabel,
+                                    style: const TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w700,
+                                      color: Color(0xFF334155),
+                                    ),
+                                  ),
+                                ),
+                                if (notifyOn)
+                                  const Icon(
+                                    Icons.notifications_active_rounded,
+                                    size: 13,
+                                    color: Color(0xFF059669),
+                                  ),
+                              ],
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              item['title']?.toString() ?? '',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700,
+                                decoration: done ? TextDecoration.lineThrough : null,
+                                color: done
+                                    ? const Color(0xFF8E8E93)
+                                    : const Color(0xFF1C1C1E),
+                              ),
+                            ),
+                            Text(
+                              item['detail']?.toString() ?? '',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFF6E6E73),
+                              ),
+                            ),
+                            if (durMin > 0)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 6),
+                                child: OutlinedButton.icon(
+                                  onPressed: () => _startCareCountdown(
+                                    item['title']?.toString() ?? 'Rawatan',
+                                    durMin,
+                                  ),
+                                  style: OutlinedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 4,
+                                    ),
+                                    minimumSize: Size.zero,
+                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                  ),
+                                  icon: const Icon(Icons.timer_outlined, size: 14),
+                                  label: Text(
+                                    'Mulai Timer (${durMin}m)',
+                                    style: const TextStyle(fontSize: 11.5),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            tooltip: 'Edit',
+                            onPressed: () => _showCareItemEditorSheet(editIndex: i),
+                            icon: const Icon(
+                              Icons.edit_outlined,
+                              size: 18,
+                              color: Color(0xFF475569),
+                            ),
+                          ),
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            tooltip: 'Hapus',
+                            onPressed: () => _deleteCareItem(i),
+                            icon: const Icon(
+                              Icons.delete_outline_rounded,
+                              size: 18,
+                              color: Color(0xFFEF4444),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
                 );
               }),
+            ],
+          ),
+        ),
+        const SizedBox(height: 14),
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(color: const Color(0xFFE5E5EA)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    'Log Hasil Settingan & Lomba',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xFF1C1C1E),
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: _showAddSettingLogDialog,
+                    icon: const Icon(Icons.add_rounded, size: 18),
+                    label: const Text('Catat'),
+                  ),
+                ],
+              ),
+              if (_settingLogs.isEmpty)
+                const Text(
+                  'Belum ada catatan settingan. Catat takaran EF, jemur, dan hasil kerja gacoan Anda di sini.',
+                  style: TextStyle(fontSize: 12, color: Color(0xFF6E6E73)),
+                )
+              else
+                ...List.generate(_settingLogs.length, (idx) {
+                  final log = _settingLogs[idx];
+                  return Container(
+                    margin: const EdgeInsets.only(top: 8),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF8FAFC),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: const Color(0xFFE2E8F0)),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '${log['date'] ?? ''} • ${log['outcome'] ?? ''} • Jemur ${log['jemurMin'] ?? 0}m',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: _appleBlue,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                log['event']?.toString() ?? '',
+                                style: const TextStyle(
+                                  fontSize: 13.5,
+                                  fontWeight: FontWeight.w800,
+                                  color: Color(0xFF1C1C1E),
+                                ),
+                              ),
+                              Text(
+                                log['ef']?.toString() ?? '',
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Color(0xFF475569),
+                                ),
+                              ),
+                              if ((log['notes']?.toString() ?? '').isNotEmpty)
+                                Text(
+                                  log['notes'].toString(),
+                                  style: const TextStyle(
+                                    fontSize: 11.5,
+                                    color: Color(0xFF6E6E73),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () async {
+                            setState(() => _settingLogs.removeAt(idx));
+                            await _saveCareState();
+                          },
+                          icon: const Icon(
+                            Icons.delete_outline_rounded,
+                            size: 18,
+                            color: Color(0xFFEF4444),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }),
             ],
           ),
         ),
@@ -3644,6 +4546,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                         const SizedBox(height: 2),
+                        const SizedBox(height: 3),
+                        Text(
+                          ApiService.instance.expiresAtDate == null
+                              ? 'Expired: Selamanya (Lifetime)'
+                              : 'Expired: ${ApiService.instance.expiryDisplayLabel} (Sisa ${ApiService.instance.remainingDaysLeft ?? 0} hari)',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: (ApiService.instance.remainingDaysLeft ?? 99) <= 3
+                                ? const Color(0xFFB45309)
+                                : const Color(0xFF059669),
+                          ),
+                        ),
+                        const SizedBox(height: 2),
                         Text(
                           'Auto-Sync Server Aktif • Rev #${_cfg.otaRevision} (tiap ${_cfg.syncIntervalSec}d)',
                           style: TextStyle(
@@ -3702,6 +4618,74 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     label: const Text('Keluar'),
                   ),
                 ],
+              ),
+            ],
+          ),
+        ),
+        Container(
+          margin: const EdgeInsets.only(bottom: 16),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: const Color(0xFFBAE6FD)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 42,
+                    height: 42,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFEFF6FF),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Icon(Icons.speaker_rounded, color: _appleBlue),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Smart Musik Box Offline (1 Key)',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w800,
+                            color: Color(0xFF1C1C1E),
+                          ),
+                        ),
+                        Text(
+                          (session?.musicBoxKey.isNotEmpty ?? false)
+                              ? 'Key: ${session!.musicBoxKey} • ${session.musicBoxDeviceId.isNotEmpty ? "Terkunci di Box" : "Belum Pairing"}'
+                              : 'Buat 1 Key Musik Box & kirim jadwal via Bluetooth',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFF6E6E73),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: _appleBlue,
+                  minimumSize: const Size(double.infinity, 44),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                onPressed: () async {
+                  await MusicBoxSheet.show(context, accentColor: _appleBlue);
+                  if (mounted) setState(() {});
+                },
+                icon: const Icon(Icons.bluetooth_connected_rounded, size: 18),
+                label: const Text('Kelola Key & Kirim ke Musik Box'),
               ),
             ],
           ),

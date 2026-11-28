@@ -1,6 +1,27 @@
 package com.mendekarena.mendek_arena_masteran
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import org.json.JSONObject
 import android.app.Activity
 import android.app.KeyguardManager
 import android.app.NotificationManager
@@ -546,7 +567,327 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
+                "scanMusicBoxes" -> {
+                    scanMusicBoxesBle(result)
+                }
+
+                "syncMusicBoxBle" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val address = (args?.get("address") as? String ?: "").trim()
+                    val payloadJson = (args?.get("payloadJson") as? String ?: "").trim()
+                    syncMusicBoxBleInternal(address, payloadJson, result)
+                }
+
+                "encryptFileToMbx" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val srcPath = (args?.get("srcPath") as? String ?: "").trim()
+                    val fileName = (args?.get("fileName") as? String ?: "masteran.mbx").trim()
+                    val boxKey = (args?.get("boxKey") as? String ?: "").trim()
+                    val boxDeviceId = (args?.get("boxDeviceId") as? String ?: "").trim()
+                    encryptFileToMbxInternal(srcPath, fileName, boxKey, boxDeviceId, result)
+                }
+
                 else -> result.notImplemented()
+            }
+        }
+    }
+
+
+    private fun hasBlePermissions(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun scanMusicBoxesBle(result: MethodChannel.Result) {
+        if (!hasBlePermissions()) {
+            result.error("NO_BLE_PERM", "Izin Bluetooth belum diberikan.", null)
+            return
+        }
+        val btMgr = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val adapter: BluetoothAdapter? = btMgr?.adapter
+        if (adapter == null || !adapter.isEnabled) {
+            result.error("BT_OFF", "Bluetooth HP dalam keadaan mati. Nyalakan Bluetooth dulu.", null)
+            return
+        }
+        val scanner = adapter.bluetoothLeScanner
+        if (scanner == null) {
+            result.error("NO_SCANNER", "Pemindai BLE tidak tersedia di perangkat ini.", null)
+            return
+        }
+
+        val foundMap = ConcurrentHashMap<String, Map<String, Any>>()
+        val cb = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, scanResult: ScanResult) {
+                val dev = scanResult.device ?: return
+                val addr = dev.address ?: return
+                val name = dev.name ?: scanResult.scanRecord?.deviceName ?: ""
+                if (name.isBlank()) return
+                val isMendek = name.contains("MendekBox", ignoreCase = true)
+                foundMap[addr] = mapOf(
+                    "address" to addr,
+                    "name" to name,
+                    "rssi" to scanResult.rssi,
+                    "isMendekBox" to isMendek
+                )
+            }
+        }
+
+        try {
+            scanner.startScan(cb)
+        } catch (e: Exception) {
+            result.error("SCAN_ERR", e.message ?: "Gagal memulai scan Bluetooth.", null)
+            return
+        }
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                scanner.stopScan(cb)
+            } catch (_: Exception) {
+            }
+            val list = foundMap.values.sortedWith(
+                compareByDescending<Map<String, Any>> { it["isMendekBox"] == true }
+                    .thenByDescending { (it["rssi"] as? Int) ?: -100 }
+            )
+            result.success(list)
+        }, 3500)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun syncMusicBoxBleInternal(
+        address: String,
+        payloadJson: String,
+        result: MethodChannel.Result
+    ) {
+        if (!hasBlePermissions()) {
+            result.success(mapOf("ok" to false, "error" to "Izin Bluetooth belum aktif."))
+            return
+        }
+        if (address.isEmpty() || payloadJson.isEmpty()) {
+            result.success(mapOf("ok" to false, "error" to "Alamat Bluetooth atau data jadwal kosong."))
+            return
+        }
+        val btMgr = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val adapter = btMgr?.adapter
+        if (adapter == null || !adapter.isEnabled) {
+            result.success(mapOf("ok" to false, "error" to "Bluetooth HP mati."))
+            return
+        }
+
+        val serviceUuid = UUID.fromString("4D454E44-454B-0001-0000-000000000001")
+        val infoUuid = UUID.fromString("4D454E44-454B-0002-0000-000000000001")
+        val writeUuid = UUID.fromString("4D454E44-454B-0003-0000-000000000001")
+
+        val device = try {
+            adapter.getRemoteDevice(address)
+        } catch (_: Exception) {
+            result.success(mapOf("ok" to false, "error" to "Alamat Bluetooth tidak valid."))
+            return
+        }
+
+        var finished = false
+        fun finishOnce(payload: Map<String, Any>) {
+            if (finished) return
+            finished = true
+            runOnUiThread { result.success(payload) }
+        }
+
+        val fullBytes = (payloadJson + "\n").toByteArray(Charsets.UTF_8)
+        var boxDeviceId = ""
+        var boxName = device.name ?: "MendekBox"
+        var writeOffset = 0
+        var chunkSize = 20
+        var writeCharRef: BluetoothGattCharacteristic? = null
+
+        val gattCb = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    try {
+                        gatt.requestMtu(256)
+                    } catch (_: Exception) {
+                        gatt.discoverServices()
+                    }
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    try { gatt.close() } catch (_: Exception) {}
+                    if (!finished) {
+                        finishOnce(mapOf("ok" to false, "error" to "Koneksi Bluetooth ke Musik Box terputus."))
+                    }
+                }
+            }
+
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS && mtu > 23) {
+                    chunkSize = (mtu - 5).coerceIn(20, 200)
+                }
+                gatt.discoverServices()
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    gatt.disconnect()
+                    finishOnce(mapOf("ok" to false, "error" to "Gagal membaca layanan Bluetooth Musik Box."))
+                    return
+                }
+                val svc = gatt.getService(serviceUuid)
+                val infoChar = svc?.getCharacteristic(infoUuid)
+                val wChar = svc?.getCharacteristic(writeUuid)
+                if (svc == null || infoChar == null || wChar == null) {
+                    gatt.disconnect()
+                    finishOnce(mapOf("ok" to false, "error" to "Perangkat ini bukan Smart Musik Box Mendek Arena."))
+                    return
+                }
+                writeCharRef = wChar
+                gatt.readCharacteristic(infoChar)
+            }
+
+            @Suppress("DEPRECATION")
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int
+            ) {
+                if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == infoUuid) {
+                    try {
+                        val txt = String(characteristic.value ?: ByteArray(0), Charsets.UTF_8)
+                        val obj = JSONObject(txt)
+                        boxDeviceId = obj.optString("box_device_id", "").trim()
+                        val n = obj.optString("name", "").trim()
+                        if (n.isNotEmpty()) boxName = n
+                    } catch (_: Exception) {
+                    }
+                }
+                if (boxDeviceId.isEmpty()) {
+                    gatt.disconnect()
+                    finishOnce(mapOf("ok" to false, "error" to "Musik Box tidak mengembalikan Chip ID."))
+                    return
+                }
+                writeNextChunk(gatt)
+            }
+
+            @Suppress("DEPRECATION")
+            private fun writeNextChunk(gatt: BluetoothGatt) {
+                val wc = writeCharRef ?: return
+                if (writeOffset >= fullBytes.size) {
+                    gatt.disconnect()
+                    finishOnce(mapOf("ok" to true, "boxDeviceId" to boxDeviceId, "boxName" to boxName))
+                    return
+                }
+                val end = minOf(writeOffset + chunkSize, fullBytes.size)
+                val slice = fullBytes.copyOfRange(writeOffset, end)
+                writeOffset = end
+                wc.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                wc.value = slice
+                if (!gatt.writeCharacteristic(wc)) {
+                    gatt.disconnect()
+                    finishOnce(mapOf("ok" to false, "error" to "Gagal menulis data jadwal ke Musik Box."))
+                }
+            }
+
+            override fun onCharacteristicWrite(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int
+            ) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    gatt.disconnect()
+                    finishOnce(mapOf("ok" to false, "error" to "Musik Box gagal menyimpan potongan data."))
+                    return
+                }
+                writeNextChunk(gatt)
+            }
+        }
+
+        val gatt = device.connectGatt(this, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (!finished) {
+                try { gatt?.disconnect(); gatt?.close() } catch (_: Exception) {}
+                finishOnce(mapOf("ok" to false, "error" to "Waktu pairing Bluetooth habis (timeout 15 detik)."))
+            }
+        }, 15000)
+    }
+
+    private fun encryptFileToMbxInternal(
+        srcPath: String,
+        fileName: String,
+        boxKey: String,
+        boxDeviceId: String,
+        result: MethodChannel.Result
+    ) {
+        if (srcPath.isEmpty() || boxKey.isEmpty() || boxDeviceId.isEmpty()) {
+            result.success(mapOf("ok" to false, "error" to "Data enkripsi belum lengkap."))
+            return
+        }
+        ioExecutor.execute {
+            try {
+                val srcFile = File(srcPath)
+                if (!srcFile.exists()) {
+                    runOnUiThread {
+                        result.success(mapOf("ok" to false, "error" to "File sumber tidak ditemukan."))
+                    }
+                    return@execute
+                }
+                val plainBytes = FileInputStream(srcFile).use { it.readBytes() }
+                val nonce = ByteArray(16)
+                SecureRandom().nextBytes(nonce)
+
+                val seedStr = "${boxKey.trim().uppercase(Locale.ROOT)}:${boxDeviceId.trim().uppercase(Locale.ROOT)}:MENDEK_MBX_V1"
+                val md = MessageDigest.getInstance("SHA-256")
+                val masterSecret = md.digest(seedStr.toByteArray(Charsets.UTF_8))
+
+                val outBytes = ByteArray(24 + plainBytes.size)
+                outBytes[0] = 'M'.code.toByte()
+                outBytes[1] = 'B'.code.toByte()
+                outBytes[2] = 'X'.code.toByte()
+                outBytes[3] = '1'.code.toByte()
+                System.arraycopy(nonce, 0, outBytes, 4, 16)
+                val lenBuf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(plainBytes.size).array()
+                System.arraycopy(lenBuf, 0, outBytes, 20, 4)
+
+                val seedBlock = ByteArray(52)
+                System.arraycopy(masterSecret, 0, seedBlock, 0, 32)
+                System.arraycopy(nonce, 0, seedBlock, 32, 16)
+                val totalBlocks = (plainBytes.size + 31) / 32
+                for (counter in 0 until totalBlocks) {
+                    seedBlock[48] = (counter and 0xFF).toByte()
+                    seedBlock[49] = ((counter shr 8) and 0xFF).toByte()
+                    seedBlock[50] = ((counter shr 16) and 0xFF).toByte()
+                    seedBlock[51] = ((counter shr 24) and 0xFF).toByte()
+                    md.reset()
+                    val keyBlock = md.digest(seedBlock)
+                    val base = counter * 32
+                    val limit = minOf(32, plainBytes.size - base)
+                    for (j in 0 until limit) {
+                        outBytes[24 + base + j] = (plainBytes[base + j].toInt() xor keyBlock[j].toInt()).toByte()
+                    }
+                }
+
+                val safeName = if (fileName.lowercase(Locale.ROOT).endsWith(".mbx")) fileName else "$fileName.mbx"
+                val outDir = File(
+                    getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: filesDir,
+                    "mbx_locked"
+                )
+                if (!outDir.exists()) outDir.mkdirs()
+                val outFile = File(outDir, safeName)
+                FileOutputStream(outFile).use { it.write(outBytes) }
+
+                runOnUiThread {
+                    result.success(
+                        mapOf(
+                            "ok" to true,
+                            "outputPath" to outFile.absolutePath,
+                            "fileName" to safeName,
+                            "sizeBytes" to outBytes.size
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    result.success(mapOf("ok" to false, "error" to (e.message ?: "Gagal mengunci file audio.")))
+                }
             }
         }
     }

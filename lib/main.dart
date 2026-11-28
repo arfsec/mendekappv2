@@ -10,15 +10,30 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await ApiService.instance.init();
   await NotifService.instance.init();
+  String? initialAuthError;
+  if (ApiService.instance.session != null &&
+      ApiService.instance.isSessionExpired) {
+    initialAuthError = 'License expired, silakan meminta yang baru.';
+    await ApiService.instance.logout();
+    await NotifService.instance.showLicenseExpiredNotification(initialAuthError);
+  }
   final String? launchPayload = await NotifService.instance.getLaunchPayload();
-
-  runApp(MendekArenaApp(initialPayload: launchPayload));
+  runApp(
+    MendekArenaApp(
+      initialPayload: launchPayload,
+      initialAuthError: initialAuthError,
+    ),
+  );
 }
 
 class MendekArenaApp extends StatelessWidget {
   final String? initialPayload;
-
-  const MendekArenaApp({super.key, this.initialPayload});
+  final String? initialAuthError;
+  const MendekArenaApp({
+    super.key,
+    this.initialPayload,
+    this.initialAuthError,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -71,7 +86,10 @@ class MendekArenaApp extends StatelessWidget {
       ),
       home: ApiService.instance.hasValidSession
           ? HomeScreen(initialPayload: initialPayload)
-          : LoginScreen(pendingPayload: initialPayload),
+          : LoginScreen(
+              pendingPayload: initialPayload,
+              initialError: initialAuthError,
+            ),
     );
   }
 }

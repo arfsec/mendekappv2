@@ -249,13 +249,42 @@ class LicenseSession {
   final String labelUser;
   final String? expiresAt;
   final String boundDeviceId;
+  final String musicBoxKey;
+  final String musicBoxDeviceId;
+  final String musicBoxName;
+  final String? musicBoxSyncedAt;
 
   const LicenseSession({
     required this.key,
     required this.labelUser,
     this.expiresAt,
     required this.boundDeviceId,
+    this.musicBoxKey = '',
+    this.musicBoxDeviceId = '',
+    this.musicBoxName = '',
+    this.musicBoxSyncedAt,
   });
+
+  LicenseSession copyWith({
+    String? labelUser,
+    String? expiresAt,
+    bool clearExpiresAt = false,
+    String? musicBoxKey,
+    String? musicBoxDeviceId,
+    String? musicBoxName,
+    String? musicBoxSyncedAt,
+  }) {
+    return LicenseSession(
+      key: key,
+      labelUser: labelUser ?? this.labelUser,
+      expiresAt: clearExpiresAt ? null : (expiresAt ?? this.expiresAt),
+      boundDeviceId: boundDeviceId,
+      musicBoxKey: musicBoxKey ?? this.musicBoxKey,
+      musicBoxDeviceId: musicBoxDeviceId ?? this.musicBoxDeviceId,
+      musicBoxName: musicBoxName ?? this.musicBoxName,
+      musicBoxSyncedAt: musicBoxSyncedAt ?? this.musicBoxSyncedAt,
+    );
+  }
 
   factory LicenseSession.fromJson(Map<String, dynamic> json) {
     return LicenseSession(
@@ -263,6 +292,10 @@ class LicenseSession {
       labelUser: (json['label_user'] as String?) ?? 'Kicau Mania',
       expiresAt: json['expires_at'] as String?,
       boundDeviceId: (json['bound_device_id'] as String?) ?? '',
+      musicBoxKey: (json['music_box_key'] as String?) ?? '',
+      musicBoxDeviceId: (json['music_box_device_id'] as String?) ?? '',
+      musicBoxName: (json['music_box_name'] as String?) ?? '',
+      musicBoxSyncedAt: json['music_box_synced_at'] as String?,
     );
   }
 
@@ -271,6 +304,10 @@ class LicenseSession {
         'label_user': labelUser,
         'expires_at': expiresAt,
         'bound_device_id': boundDeviceId,
+        'music_box_key': musicBoxKey,
+        'music_box_device_id': musicBoxDeviceId,
+        'music_box_name': musicBoxName,
+        'music_box_synced_at': musicBoxSyncedAt,
       };
 }
 
@@ -374,10 +411,40 @@ class ApiService {
     if (_latestGithubApkUrl.startsWith('https://')) return _latestGithubApkUrl;
     return direct;
   }
+  String? lastAuthError;
+
   LicenseSession? get session => _session;
   RemoteConfig get remoteConfig => _remoteConfig;
   List<CatalogPreset> get catalog => _catalog;
-  bool get hasValidSession => _session != null && _session!.key.isNotEmpty;
+
+  DateTime? get expiresAtDate {
+    final raw = _session?.expiresAt?.trim();
+    if (raw == null || raw.isEmpty) return null;
+    return DateTime.tryParse(raw.replaceFirst(' ', 'T'));
+  }
+
+  bool get isSessionExpired {
+    final d = expiresAtDate;
+    if (d == null) return false;
+    return DateTime.now().isAfter(d);
+  }
+
+  int? get remainingDaysLeft {
+    final d = expiresAtDate;
+    if (d == null) return null;
+    final diffHours = d.difference(DateTime.now()).inHours;
+    if (diffHours <= 0) return 0;
+    return (diffHours / 24).ceil();
+  }
+
+  String get expiryDisplayLabel {
+    final raw = _session?.expiresAt?.trim();
+    if (raw == null || raw.isEmpty) return 'Selamanya (Lifetime)';
+    return raw.length >= 10 ? raw.substring(0, 10) : raw;
+  }
+
+  bool get hasValidSession =>
+      _session != null && _session!.key.isNotEmpty && !isSessionExpired;
 
   String get _deviceLabel {
     if (Platform.isAndroid) return 'Android HP';
@@ -850,6 +917,7 @@ class ApiService {
 
       final body = jsonDecode(response.body) as Map<String, dynamic>;
       if (response.statusCode == 200 && body['ok'] == true) {
+        lastAuthError = null;
         final userMap = body['user'] as Map<String, dynamic>;
         _session = LicenseSession.fromJson(userMap);
         await _prefs?.setString(_prefSession, jsonEncode(_session!.toJson()));
@@ -885,6 +953,11 @@ class ApiService {
 
   Future<bool> revalidateInBackground() async {
     if (_session == null) return false;
+    if (isSessionExpired) {
+      lastAuthError = 'License expired, silakan meminta yang baru.';
+      await logout();
+      return false;
+    }
     try {
       final batteryFields = await _readBatteryPingFields();
       final response = await http
@@ -902,6 +975,17 @@ class ApiService {
 
       final body = jsonDecode(response.body) as Map<String, dynamic>;
       if (body['ok'] == true) {
+        if (body['user'] is Map<String, dynamic>) {
+          final u = body['user'] as Map<String, dynamic>;
+          final newExp = u['expires_at'] as String?;
+          final newLabel = (u['label_user'] as String?)?.trim();
+          _session = _session!.copyWith(
+            labelUser: (newLabel != null && newLabel.isNotEmpty) ? newLabel : null,
+            expiresAt: newExp,
+            clearExpiresAt: newExp == null || newExp.trim().isEmpty,
+          );
+          await _prefs?.setString(_prefSession, jsonEncode(_session!.toJson()));
+        }
         if (body['remote_config'] is Map<String, dynamic>) {
           _remoteConfig = RemoteConfig.fromJson(
             body['remote_config'] as Map<String, dynamic>,
@@ -912,16 +996,38 @@ class ApiService {
           );
           _lastSyncedAt = DateTime.now();
         }
+        if (isSessionExpired) {
+          lastAuthError = 'License expired, silakan meminta yang baru.';
+          await logout();
+          return false;
+        }
         unawaited(fetchCatalog());
         return true;
       }
 
       if (response.statusCode == 403 || response.statusCode == 404) {
+        final reason = (body['reason'] as String?) ?? '';
+        final srvMsg = (body['message'] as String?) ?? '';
+        final low = srvMsg.toLowerCase();
+        if (reason == 'expired' ||
+            low.contains('expired') ||
+            low.contains('kadaluwarsa') ||
+            low.contains('berakhir')) {
+          lastAuthError = 'License expired, silakan meminta yang baru.';
+        } else {
+          lastAuthError =
+              srvMsg.isNotEmpty ? srvMsg : 'Akses license berakhir.';
+        }
         await logout();
         return false;
       }
     } catch (_) {
-      // Tetap pertahankan sesi saat offline
+      // Tetap pertahankan sesi saat offline kecuali jika sudah lewat tanggal expired
+      if (isSessionExpired) {
+        lastAuthError = 'License expired, silakan meminta yang baru.';
+        await logout();
+        return false;
+      }
     }
     return true;
   }
@@ -945,6 +1051,98 @@ class ApiService {
           )
           .timeout(const Duration(seconds: 6));
     } catch (_) {}
+  }
+
+
+  Future<VerifyResult> issueMusicBoxKey() async {
+    if (_session == null) {
+      return const VerifyResult(ok: false, message: 'Login Key diperlukan.');
+    }
+    try {
+      final response = await http
+          .post(
+            Uri.parse(baseUrl),
+            body: {
+              'action': 'issue_music_box_key',
+              'key': _session!.key,
+              'device_id': _deviceId,
+            },
+          )
+          .timeout(const Duration(seconds: 10));
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && body['ok'] == true) {
+        final box = (body['music_box'] as Map<String, dynamic>?) ?? {};
+        _session = _session!.copyWith(
+          musicBoxKey: (box['box_key'] as String?) ?? '',
+          musicBoxDeviceId: (box['box_device_id'] as String?) ?? '',
+          musicBoxName: (box['box_name'] as String?) ?? '',
+          musicBoxSyncedAt: box['synced_at'] as String?,
+        );
+        await _prefs?.setString(_prefSession, jsonEncode(_session!.toJson()));
+        return VerifyResult(
+          ok: true,
+          message: (body['message'] as String?) ?? 'Key Musik Box siap.',
+        );
+      }
+      return VerifyResult(
+        ok: false,
+        message: (body['message'] as String?) ?? 'Gagal membuat Key Musik Box.',
+      );
+    } catch (_) {
+      return const VerifyResult(
+        ok: false,
+        message: 'Gagal terhubung ke server untuk membuat Key Musik Box.',
+      );
+    }
+  }
+
+  Future<VerifyResult> bindMusicBox({
+    required String boxKey,
+    required String boxDeviceId,
+    required String boxName,
+  }) async {
+    if (_session == null) {
+      return const VerifyResult(ok: false, message: 'Login Key diperlukan.');
+    }
+    try {
+      final response = await http
+          .post(
+            Uri.parse(baseUrl),
+            body: {
+              'action': 'bind_music_box',
+              'key': _session!.key,
+              'device_id': _deviceId,
+              'box_key': boxKey,
+              'box_device_id': boxDeviceId,
+              'box_name': boxName,
+            },
+          )
+          .timeout(const Duration(seconds: 10));
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && body['ok'] == true) {
+        final box = (body['music_box'] as Map<String, dynamic>?) ?? {};
+        _session = _session!.copyWith(
+          musicBoxKey: (box['box_key'] as String?) ?? boxKey,
+          musicBoxDeviceId: (box['box_device_id'] as String?) ?? boxDeviceId,
+          musicBoxName: (box['box_name'] as String?) ?? boxName,
+          musicBoxSyncedAt: box['synced_at'] as String?,
+        );
+        await _prefs?.setString(_prefSession, jsonEncode(_session!.toJson()));
+        return VerifyResult(
+          ok: true,
+          message: (body['message'] as String?) ?? 'Musik Box terkunci & sinkron!',
+        );
+      }
+      return VerifyResult(
+        ok: false,
+        message: (body['message'] as String?) ?? 'Gagal mengikat Musik Box.',
+      );
+    } catch (_) {
+      return const VerifyResult(
+        ok: false,
+        message: 'Gagal menghubungi server untuk mengikat Musik Box.',
+      );
+    }
   }
 
   Future<void> logout() async {
